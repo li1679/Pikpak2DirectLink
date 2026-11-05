@@ -211,10 +211,34 @@ type updateAuthSettingsRequest struct {
 }
 
 func (s *Server) linuxDoClientID() string {
+	if s.oauthProviders != nil {
+		if p, err := s.oauthProviders.get("linuxdo"); err == nil {
+			return p.ClientID
+		}
+		if s.oauthProviders.legacyLinuxDoDeleted() {
+			return ""
+		}
+	}
+	return s.legacyLinuxDoClientID()
+}
+
+func (s *Server) legacyLinuxDoClientID() string {
 	return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientID, ""))
 }
 
 func (s *Server) linuxDoClientSecret() string {
+	if s.oauthProviders != nil {
+		if p, err := s.oauthProviders.get("linuxdo"); err == nil {
+			return p.ClientSecret
+		}
+		if s.oauthProviders.legacyLinuxDoDeleted() {
+			return ""
+		}
+	}
+	return s.legacyLinuxDoClientSecret()
+}
+
+func (s *Server) legacyLinuxDoClientSecret() string {
 	if s.appSecrets == nil {
 		return strings.TrimSpace(s.settings.getString(settingKeyLinuxDoClientSecret, ""))
 	}
@@ -232,7 +256,7 @@ func (s *Server) linuxDoOAuthConfigured() bool {
 func (s *Server) authSettingsPayload(r *http.Request) authSettingsResponse {
 	clientID := s.linuxDoClientID()
 	secretConfigured := s.linuxDoClientSecret() != ""
-	return authSettingsResponse{
+	resp := authSettingsResponse{
 		LinuxDoClientID:               clientID,
 		LinuxDoClientSecretConfigured: secretConfigured,
 		LinuxDoCallbackURL:            strings.TrimRight(s.baseURL(r), "/") + "/api/u/auth/linuxdo/callback",
@@ -242,6 +266,11 @@ func (s *Server) authSettingsPayload(r *http.Request) authSettingsResponse {
 		EmailLoginEnabled:             s.settings.getBool(settingKeyEmailLoginEnabled, true),
 		EmailRegistrationEnabled:      s.settings.getBool(settingKeyEmailRegistrationEnabled, false),
 	}
+	if p, err := s.effectiveOAuthProvider("linuxdo"); err == nil {
+		resp.LinuxDoLoginEnabled = p.LoginEnabled
+		resp.LinuxDoRegistrationEnabled = p.RegistrationEnabled
+	}
+	return resp
 }
 
 func (s *Server) settingsPayload() settingsResponse {
@@ -276,6 +305,28 @@ func (s *Server) handleUpdateAuthSettings(w http.ResponseWriter, r *http.Request
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if s.oauthProviders != nil && (req.LinuxDoClientID != nil || req.LinuxDoClientSecret != nil || req.ClearLinuxDoClientSecret || req.LinuxDoLoginEnabled != nil || req.LinuxDoRegistrationEnabled != nil) {
+		if p, err := s.oauthProviders.get("linuxdo"); err == nil {
+			if req.LinuxDoClientID != nil {
+				p.ClientID = strings.TrimSpace(*req.LinuxDoClientID)
+			}
+			if req.LinuxDoLoginEnabled != nil {
+				p.LoginEnabled = *req.LinuxDoLoginEnabled
+			}
+			if req.LinuxDoRegistrationEnabled != nil {
+				p.RegistrationEnabled = *req.LinuxDoRegistrationEnabled
+			}
+			if _, err := s.oauthProviders.update("linuxdo", p, req.LinuxDoClientSecret, req.ClearLinuxDoClientSecret, p.Revision); err != nil {
+				writeOAuthProviderError(w, err)
+				return
+			}
+			req.LinuxDoClientID = nil
+			req.LinuxDoClientSecret = nil
+			req.ClearLinuxDoClientSecret = false
+			req.LinuxDoLoginEnabled = nil
+			req.LinuxDoRegistrationEnabled = nil
+		}
 	}
 	if req.LinuxDoClientID != nil {
 		if err := s.settings.setString(settingKeyLinuxDoClientID, strings.TrimSpace(*req.LinuxDoClientID)); err != nil {
@@ -334,6 +385,12 @@ func (s *Server) handleUpdateAuthSettings(w http.ResponseWriter, r *http.Request
 		}
 	}
 	s.logJob(LogSuccess, "", "user authentication settings updated")
+	if s.oauthProviders != nil {
+		if err := s.oauthProviders.importLegacyLinuxDo(); err != nil {
+			writeOAuthProviderError(w, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, s.authSettingsPayload(r))
 }
 

@@ -262,6 +262,12 @@ ON proxy_temp_cleanups(cleanup_after);`
 	if err := migrateStorageSchema(db); err != nil {
 		return fmt.Errorf("migrate storage schema: %w", err)
 	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS user_session_auth (
+		token_hash TEXT PRIMARY KEY REFERENCES user_sessions(token_hash) ON DELETE CASCADE,
+		provider_id TEXT NOT NULL, provider_name TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("migrate login method metadata: %w", err)
+	}
 	return nil
 }
 

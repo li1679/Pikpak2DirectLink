@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.4.0 - 2026-11-05 - Configurable community OAuth login
+
+- Add administrator-managed OAuth providers with custom names, endpoints, scopes, field mappings, ordering, registration controls, and encrypted client secrets.
+- Show enabled, configured login methods dynamically in the user portal and record the method used by each session.
+- Preserve existing LinuxDO users, configuration, and callback URLs while isolating identities by provider and stable subject ID.
+- Bind callbacks to their browser, provider, configuration revision, and optional PKCE verifier; reject stale, replayed, or cross-provider callbacks.
+
 ## v3.3.1 - 2026-10-27 - Admin file library
 
 - Add a persistent admin file library for magnet and PikPak share links, with file counts, folders, and context-menu move, rename, retry, and delete operations.

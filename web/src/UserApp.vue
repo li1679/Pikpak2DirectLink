@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   ArrowLeft, CalendarClock, CheckCheck, ClockAlert, Files, Gauge, History, Hourglass, Inbox, KeyRound,
   Link2, LogOut, Mail, Radar, RefreshCw, Send, Settings2, Ticket, TriangleAlert, UserPlus, Waypoints, X,
@@ -25,12 +25,25 @@ import type { JobResult, ResolveHistoryDetail, ResolveHistorySummary, UserAuthCo
 const view = ref<'gate' | 'portal'>('gate')
 const status = ref<UserStatusResponse | null>(null)
 const authConfig = ref<UserAuthConfig | null>(null)
+const authConfigLoading = ref(true)
+const authConfigError = ref('')
 
 const emailMode = ref<'login' | 'register'>('login')
 const email = ref('')
 const password = ref('')
 const loginError = ref('')
 const loginLoading = ref(false)
+
+const oauthProviders = computed(() => authConfig.value?.oauth_providers ?? [])
+const hasEmailAuth = computed(() => Boolean(authConfig.value?.email_login_enabled || authConfig.value?.email_registration_enabled))
+const hasLoginMethods = computed(() => oauthProviders.value.length > 0 || hasEmailAuth.value)
+watch(authConfig, (config) => {
+  if (emailMode.value === 'login' && !config?.email_login_enabled && config?.email_registration_enabled) {
+    emailMode.value = 'register'
+  } else if (emailMode.value === 'register' && !config?.email_registration_enabled && config?.email_login_enabled) {
+    emailMode.value = 'login'
+  }
+})
 
 const subscriptionOpen = ref(false)
 const redeemOpen = ref(false)
@@ -84,10 +97,15 @@ setUnauthorizedHandler(() => {
 })
 
 async function loadAuthConfig() {
+  authConfigLoading.value = true
+  authConfigError.value = ''
   try {
     authConfig.value = await api.u.authConfig()
-  } catch {
+  } catch (e: any) {
     authConfig.value = null
+    authConfigError.value = e?.message || '无法加载登录方式，请重试'
+  } finally {
+    authConfigLoading.value = false
   }
 }
 
@@ -95,6 +113,8 @@ async function loadStatus() {
   try {
     status.value = await api.u.status()
     authConfig.value = status.value.auth
+    authConfigLoading.value = false
+    authConfigError.value = ''
     view.value = 'portal'
   } catch {
     status.value = null
@@ -103,13 +123,18 @@ async function loadStatus() {
   }
 }
 
-function linuxDoLogin() {
-  if (!authConfig.value?.linuxdo_available) return
-  window.location.href = authConfig.value.linuxdo_start_url || '/api/u/auth/linuxdo/start'
+function oauthLogin(providerID: string) {
+  const provider = oauthProviders.value.find((p) => p.id === providerID)
+  if (!provider?.start_url) return
+  window.location.href = provider.start_url
 }
 
 async function submitEmailAuth() {
   loginError.value = ''
+  if (emailMode.value === 'register' ? !authConfig.value?.email_registration_enabled : !authConfig.value?.email_login_enabled) {
+    loginError.value = '此登录方式当前未开放，请刷新后重试'
+    return
+  }
   if (!email.value.trim() || password.value.length < 6) {
     loginError.value = '请输入邮箱和至少 6 位密码'
     return
@@ -395,7 +420,7 @@ onMounted(async () => {
   const params = new URLSearchParams(window.location.search)
   const authError = params.get('error')
   if (authError) {
-    toast(`LinuxDo 登录失败：${authError}`, 'error')
+    toast(`授权登录失败：${authError}`, 'error')
     window.history.replaceState({}, '', '/u')
   }
   await loadStatus()
@@ -553,19 +578,24 @@ onUnmounted(invalidateRestore)
         <div class="wire"><span class="wire-pulse" /></div>
         <div class="mark"><Radar /></div>
         <h1>用户登录</h1>
-        <p class="lede">LinuxDo 社区用户可直接登录，额度通过 CDK 兑换</p>
-        <PrimaryButton v-if="authConfig?.linuxdo_available" block size="lg" @click="linuxDoLogin">
-          <template #icon><Radar /></template>使用 LinuxDo 登录
-        </PrimaryButton>
-        <p v-else class="auth-note">LinuxDo 登录暂未开放</p>
+        <p class="lede">选择登录方式，额度通过 CDK 兑换</p>
+        <p v-if="authConfigLoading" class="auth-note">正在加载登录方式…</p>
+        <div v-else-if="authConfigError" class="auth-load-error"><p class="error-block">{{ authConfigError }}</p><PrimaryButton variant="line" block @click="loadAuthConfig"><template #icon><RefreshCw /></template>重新加载</PrimaryButton></div>
+        <p v-else-if="!hasLoginMethods" class="auth-note">暂未开放登录，请联系管理员</p>
+        <div v-if="oauthProviders.length" class="oauth-methods">
+          <div v-for="provider in oauthProviders" :key="provider.id" class="oauth-method">
+            <PrimaryButton block size="lg" @click="oauthLogin(provider.id)"><template #icon><Radar /></template>使用 {{ provider.name }} 登录</PrimaryButton>
+            <p v-if="!provider.registration_enabled" class="provider-auth-note">仅限已注册用户</p>
+          </div>
+        </div>
 
-        <form v-if="authConfig?.email_login_enabled || authConfig?.email_registration_enabled" class="email-form" @submit.prevent="submitEmailAuth">
-          <div v-if="authConfig?.email_registration_enabled" class="seg email-tabs">
+        <form v-if="hasEmailAuth" class="email-form" @submit.prevent="submitEmailAuth">
+          <div v-if="authConfig?.email_login_enabled && authConfig?.email_registration_enabled" class="seg email-tabs">
             <label class="seg-item"><input v-model="emailMode" type="radio" value="login" /><span><Mail />登录</span></label>
             <label class="seg-item"><input v-model="emailMode" type="radio" value="register" /><span><UserPlus />注册</span></label>
           </div>
-          <input v-model="email" class="input" type="email" autocomplete="email" placeholder="email@example.com" />
-          <input v-model="password" class="input" type="password" autocomplete="current-password" placeholder="Password" />
+          <input v-model="email" class="input" type="email" autocomplete="email" aria-label="邮箱" placeholder="email@example.com" required />
+          <input v-model="password" class="input" type="password" :autocomplete="emailMode === 'register' ? 'new-password' : 'current-password'" aria-label="密码" placeholder="密码（至少 6 位）" minlength="6" required />
           <PrimaryButton type="submit" block :loading="loginLoading">
             <template #icon><KeyRound /></template>{{ emailMode === 'register' ? '邮箱注册' : '邮箱登录' }}
           </PrimaryButton>
@@ -581,6 +611,7 @@ onUnmounted(invalidateRestore)
           <div>
             <div class="title">PikPak 直链工具</div>
             <div class="sub mono">{{ displayName }}</div>
+            <div v-if="status?.login_method" class="login-method">登录方式：{{ status.login_method.name }}</div>
           </div>
         </div>
         <div class="pills">
@@ -653,6 +684,11 @@ onUnmounted(invalidateRestore)
 .gate-card h1 { font-size: var(--fs-xl); font-weight: var(--fw-bold); }
 .lede { color: var(--ink-2); font-size: var(--fs-sm); margin-top: 5px; margin-bottom: 18px; }
 .auth-note { margin: 0 0 13px; color: var(--ink-3); font-size: var(--fs-sm); }
+.oauth-methods { display: grid; gap: 10px; }
+.oauth-method { min-width: 0; }
+.oauth-method .btn { white-space: normal; overflow-wrap: anywhere; }
+.provider-auth-note { margin-top: 5px; color: var(--ink-3); font-size: var(--fs-xs); }
+.auth-load-error { display: grid; gap: 10px; }
 .email-form { display: grid; gap: 10px; margin-top: 14px; text-align: left; }
 .email-tabs { width: 100%; }
 .email-tabs .seg-item { flex: 1 1 0; }
@@ -665,6 +701,7 @@ onUnmounted(invalidateRestore)
 .logo svg { width: 19px; height: 19px; }
 .title { font-size: var(--fs-md); font-weight: var(--fw-semi); }
 .sub { color: var(--ink-3); font-size: var(--fs-xs); margin-top: 1px; }
+.login-method { color: var(--ink-2); font-size: var(--fs-xs); margin-top: 3px; overflow-wrap: anywhere; }
 .pills { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
 .workbench { display: flex; flex-direction: column; gap: 16px; }
 .eyebrow { display: block; margin-bottom: 2px; }

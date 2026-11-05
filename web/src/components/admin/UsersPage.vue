@@ -39,6 +39,7 @@ const GIB = 1024 ** 3
 const PAGE_SIZE = 50
 
 const users = ref<AdminUserSummary[]>([])
+const providerNames = ref(new Map<string, string>())
 const total = ref(0)
 const offset = ref(0)
 const loading = ref(true)
@@ -109,7 +110,16 @@ function displayName(item: AdminUserSummary | AdminUserDetail) {
 
 function providerLabel(provider: string) {
   const labels: Record<string, string> = { email: '邮箱', linuxdo: 'Linux DO' }
-  return labels[provider.toLowerCase()] || provider
+  return providerNames.value.get(provider) || labels[provider.toLowerCase()] || provider
+}
+
+async function loadProviderNames() {
+  try {
+    const response = await api.settings.oauthProviders.list()
+    providerNames.value = new Map((response.providers ?? []).map((provider) => [provider.id, provider.name]))
+  } catch {
+    // User management remains available when provider settings cannot be read.
+  }
 }
 
 function statusLabel(status: AdminSubscription['status']) {
@@ -316,6 +326,7 @@ watch(
 
 onMounted(() => {
   void load()
+  void loadProviderNames()
   window.addEventListener('keydown', handleEscape)
 })
 onUnmounted(() => window.removeEventListener('keydown', handleEscape))

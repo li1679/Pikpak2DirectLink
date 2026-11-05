@@ -86,6 +86,41 @@ export type UpdateAuthSettingsRequest = {
   email_registration_enabled?: boolean
 }
 
+export type OAuthProvider = {
+  id: string
+  name: string
+  authorization_url: string
+  token_url: string
+  userinfo_url: string
+  client_id: string
+  client_secret_configured: boolean
+  scopes: string
+  token_auth_method: 'client_secret_post' | 'client_secret_basic'
+  id_field: string
+  username_field: string
+  display_name_field: string
+  email_field: string
+  avatar_field: string
+  login_enabled: boolean
+  registration_enabled: boolean
+  sort_order: number
+  pkce_enabled: boolean
+  revision: number
+  callback_url: string
+  configured: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type OAuthProviderRequest = Pick<OAuthProvider,
+  'name' | 'authorization_url' | 'token_url' | 'userinfo_url' | 'client_id' | 'scopes' |
+  'token_auth_method' | 'id_field' | 'username_field' | 'display_name_field' | 'email_field' |
+  'avatar_field' | 'login_enabled' | 'registration_enabled' | 'sort_order' | 'pkce_enabled'> & {
+  client_secret?: string
+  clear_client_secret?: boolean
+  expected_revision?: number
+}
+
 export type UpdateSettingsRequest = {
   concurrency?: number
   task_timeout_seconds?: number
@@ -410,13 +445,9 @@ export type AdminSubscriptionRevisionRequest = {
 }
 
 export type UserAuthConfig = {
-  linuxdo_available: boolean
-  linuxdo_configured: boolean
-  linuxdo_login_enabled: boolean
-  linuxdo_registration_enabled: boolean
+  oauth_providers: { id: string; name: string; start_url: string; registration_enabled: boolean }[]
   email_login_enabled: boolean
   email_registration_enabled: boolean
-  linuxdo_start_url: string
 }
 
 export type UserStatusResponse = {
@@ -424,6 +455,7 @@ export type UserStatusResponse = {
   quota: UserQuota
   subscriptions: UserSubscription[]
   auth: UserAuthConfig
+  login_method?: { id: string; name: string; type: 'oauth' | 'email' }
   queue: { waiting: number; active: boolean }
 }
 

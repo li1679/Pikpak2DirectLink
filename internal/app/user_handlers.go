@@ -10,16 +10,18 @@ import (
 )
 
 type userAuthConfigResponse struct {
-	LinuxDoAvailable           bool   `json:"linuxdo_available"`
-	LinuxDoConfigured          bool   `json:"linuxdo_configured"`
-	LinuxDoLoginEnabled        bool   `json:"linuxdo_login_enabled"`
-	LinuxDoRegistrationEnabled bool   `json:"linuxdo_registration_enabled"`
-	EmailLoginEnabled          bool   `json:"email_login_enabled"`
-	EmailRegistrationEnabled   bool   `json:"email_registration_enabled"`
-	LinuxDoStartURL            string `json:"linuxdo_start_url"`
+	OAuthProviders             []publicOAuthProvider `json:"oauth_providers"`
+	LinuxDoAvailable           bool                  `json:"linuxdo_available"`
+	LinuxDoConfigured          bool                  `json:"linuxdo_configured"`
+	LinuxDoLoginEnabled        bool                  `json:"linuxdo_login_enabled"`
+	LinuxDoRegistrationEnabled bool                  `json:"linuxdo_registration_enabled"`
+	EmailLoginEnabled          bool                  `json:"email_login_enabled"`
+	EmailRegistrationEnabled   bool                  `json:"email_registration_enabled"`
+	LinuxDoStartURL            string                `json:"linuxdo_start_url"`
 }
 
 type userStatusResponse struct {
+	LoginMethod   *userLoginMethod       `json:"login_method,omitempty"`
 	User          User                   `json:"user"`
 	Quota         UserQuota              `json:"quota"`
 	Subscriptions []UserSubscription     `json:"subscriptions"`
@@ -55,12 +57,22 @@ func (s *Server) handleUserPortal(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) userAuthConfigPayload(r *http.Request) userAuthConfigResponse {
 	loginEnabled := s.settings.getBool(settingKeyLinuxDoLoginEnabled, true)
+	registrationEnabled := s.settings.getBool(settingKeyLinuxDoRegistrationEnabled, true)
+	if p, err := s.effectiveOAuthProvider("linuxdo"); err == nil {
+		loginEnabled = p.LoginEnabled
+		registrationEnabled = p.RegistrationEnabled
+	}
 	configured := s.linuxDoOAuthConfigured()
+	providers, err := s.publicOAuthProviders()
+	if err != nil {
+		providers = []publicOAuthProvider{}
+	}
 	return userAuthConfigResponse{
+		OAuthProviders:             providers,
 		LinuxDoAvailable:           loginEnabled && configured,
 		LinuxDoConfigured:          configured,
 		LinuxDoLoginEnabled:        loginEnabled,
-		LinuxDoRegistrationEnabled: s.settings.getBool(settingKeyLinuxDoRegistrationEnabled, true),
+		LinuxDoRegistrationEnabled: registrationEnabled,
 		EmailLoginEnabled:          s.settings.getBool(settingKeyEmailLoginEnabled, true),
 		EmailRegistrationEnabled:   s.settings.getBool(settingKeyEmailRegistrationEnabled, false),
 		LinuxDoStartURL:            "/api/u/auth/linuxdo/start",
@@ -68,6 +80,11 @@ func (s *Server) userAuthConfigPayload(r *http.Request) userAuthConfigResponse {
 }
 
 func (s *Server) handleUserAuthConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if _, err := s.publicOAuthProviders(); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "读取登录方式失败，请稍后重试")
+		return
+	}
 	writeJSON(w, http.StatusOK, s.userAuthConfigPayload(r))
 }
 
@@ -81,7 +98,11 @@ func (s *Server) currentUser(r *http.Request) (User, bool) {
 }
 
 func (s *Server) setUserSessionCookie(w http.ResponseWriter, userID string, now time.Time) error {
-	token, err := s.users.createSession(userID, now)
+	return s.setUserSessionCookieForMethod(w, userID, "email", "邮箱", now)
+}
+
+func (s *Server) setUserSessionCookieForMethod(w http.ResponseWriter, userID, providerID, providerName string, now time.Time) error {
+	token, err := s.users.createSessionForMethod(userID, providerID, providerName, now)
 	if err != nil {
 		return err
 	}
@@ -123,6 +144,7 @@ func (s *Server) userStatusPayload(user User, r *http.Request, now time.Time) (u
 		return userStatusResponse{}, err
 	}
 	resp := userStatusResponse{
+		LoginMethod:   s.userLoginMethod(r, user.ID),
 		User:          user,
 		Quota:         quota,
 		Subscriptions: subs,
@@ -134,87 +156,12 @@ func (s *Server) userStatusPayload(user User, r *http.Request, now time.Time) (u
 }
 
 func (s *Server) handleLinuxDoAuthStart(w http.ResponseWriter, r *http.Request) {
-	if !s.settings.getBool(settingKeyLinuxDoLoginEnabled, true) || !s.linuxDoOAuthConfigured() {
-		writeError(w, http.StatusServiceUnavailable, "LinuxDo login is not configured")
-		return
-	}
-	nonce, err := generateSessionID()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create OAuth state")
-		return
-	}
-	now := s.now()
-	state, err := s.oauthStates.create(nonce, now)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create OAuth state")
-		return
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     linuxDoOAuthNonceCookieName,
-		Value:    nonce,
-		Path:     "/api/u/auth/linuxdo",
-		HttpOnly: true,
-		Secure:   s.secureCookies(),
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(oauthStateTTL.Seconds()),
-		Expires:  now.Add(oauthStateTTL),
-	})
-	http.Redirect(w, r, s.linuxDoAuthorizationURL(r, state), http.StatusFound)
+	s.startOAuthProvider(w, r, "linuxdo")
 }
 
 func (s *Server) handleLinuxDoAuthCallback(w http.ResponseWriter, r *http.Request) {
-	nonce := ""
-	if cookie, err := r.Cookie(linuxDoOAuthNonceCookieName); err == nil {
-		nonce = cookie.Value
-	}
-	clearLinuxDoOAuthNonceCookie(w, s.secureCookies())
-	state := strings.TrimSpace(r.URL.Query().Get("state"))
-	if !s.oauthStates.consume(state, nonce, s.now()) {
-		redirectUserAuthError(w, r, "invalid_state")
-		return
-	}
-	if errText := strings.TrimSpace(r.URL.Query().Get("error")); errText != "" {
-		redirectUserAuthError(w, r, errText)
-		return
-	}
-	code := strings.TrimSpace(r.URL.Query().Get("code"))
-	if code == "" {
-		redirectUserAuthError(w, r, "missing_code")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), maxDuration(s.config.RequestTimeout, 20*time.Second))
-	defer cancel()
-	profile, err := s.fetchLinuxDoProfile(ctx, r, code)
-	if err != nil {
-		redirectUserAuthError(w, r, "linuxdo_auth_failed")
-		return
-	}
-	exists, err := s.users.linuxDoIdentityExists(profile.ID)
-	if err != nil {
-		redirectUserAuthError(w, r, "user_lookup_failed")
-		return
-	}
-	if !exists && !s.settings.getBool(settingKeyLinuxDoRegistrationEnabled, true) {
-		redirectUserAuthError(w, r, "linuxdo_registration_closed")
-		return
-	}
-	user, created, err := s.users.upsertLinuxDoUser(profile, s.now())
-	if err != nil {
-		if errors.Is(err, errUserDisabled) {
-			redirectUserAuthError(w, r, "user_disabled")
-			return
-		}
-		redirectUserAuthError(w, r, "user_create_failed")
-		return
-	}
-	_ = created
-	if err := s.setUserSessionCookie(w, user.ID, s.now()); err != nil {
-		redirectUserAuthError(w, r, "session_failed")
-		return
-	}
-	http.Redirect(w, r, "/u", http.StatusFound)
+	s.finishOAuthProvider(w, r, "linuxdo")
 }
-
 func clearLinuxDoOAuthNonceCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     linuxDoOAuthNonceCookieName,
@@ -278,6 +225,7 @@ func (s *Server) handleEmailRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	payload.LoginMethod = &userLoginMethod{ID: "email", Name: "邮箱", Type: "email"}
 	writeJSON(w, http.StatusCreated, payload)
 }
 
@@ -326,10 +274,12 @@ func (s *Server) handleEmailLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	payload.LoginMethod = &userLoginMethod{ID: "email", Name: "邮箱", Type: "email"}
 	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *Server) handleUserStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	user, ok := s.currentUser(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "user session is invalid or expired")

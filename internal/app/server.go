@@ -56,6 +56,7 @@ type Server struct {
 	libraryDownloads     map[string]*libraryDownload
 	tempCleanups         *proxyTempCleanupStore
 	oauthStates          *oauthStateStore
+	oauthProviders       *oauthProviderStore
 	gateHTML             []byte
 	userHTML             []byte
 	mux                  *http.ServeMux
@@ -211,6 +212,10 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("migrate legacy storage: %w", err)
 	}
+	oauthProviders, err := newOAuthProviderStore(db, secretCipher)
+	if err != nil {
+		return nil, fmt.Errorf("initialize OAuth providers: %w", err)
+	}
 	accountStore := newAccountStore(db, secretCipher)
 	if err := accountStore.RotateSecrets(); err != nil {
 		return nil, fmt.Errorf("rotate PikPak account secrets: %w", err)
@@ -308,6 +313,7 @@ func NewServer(cfg Config) (*Server, error) {
 		libraryDownloads:    make(map[string]*libraryDownload),
 		tempCleanups:        tempCleanups,
 		oauthStates:         newOAuthStateStore(),
+		oauthProviders:      oauthProviders,
 		gateHTML:            gateHTML,
 		userHTML:            userHTML,
 		mux:                 http.NewServeMux(),
@@ -401,6 +407,7 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("GET /api/u/auth/config", server.handleUserAuthConfig)
 	server.mux.HandleFunc("GET /api/u/auth/linuxdo/start", server.handleLinuxDoAuthStart)
 	server.mux.HandleFunc("GET /api/u/auth/linuxdo/callback", server.handleLinuxDoAuthCallback)
+	server.registerOAuthProviderRoutes()
 	server.mux.HandleFunc("POST /api/u/auth/email/register", server.handleEmailRegister)
 	server.mux.HandleFunc("POST /api/u/auth/email/login", server.handleEmailLogin)
 	server.mux.HandleFunc("POST /api/u/login", server.handleEmailLogin)

@@ -220,86 +220,14 @@ func (s *userStore) verifyEmailLoginWithVerifier(email, password string, verifyP
 }
 
 func (s *userStore) upsertLinuxDoUser(profile LinuxDoProfile, now time.Time) (User, bool, error) {
-	providerID := strings.TrimSpace(profile.ID)
-	if providerID == "" {
-		return User{}, false, errors.New("LinuxDo user id is missing")
+	if firstNonEmpty(profile.DisplayName, profile.Name, profile.Username) == "" {
+		profile.DisplayName = "LinuxDo User"
 	}
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return User{}, false, err
-	}
-	defer tx.Rollback()
-
-	displayName := firstNonEmpty(profile.DisplayName, profile.Name, profile.Username, "LinuxDo User")
-	email := normalizeEmail(profile.Email)
-	avatar := strings.TrimSpace(profile.AvatarURL)
-	nowUnix := now.Unix()
-
-	identity, ok, err := loadUserIdentity(tx, "linuxdo", providerID)
-	if err != nil {
-		return User{}, false, err
-	}
-	created := false
-	var user User
-	if ok {
-		if _, err := tx.Exec(
-			`UPDATE users SET email=COALESCE(NULLIF(?, ''), email), display_name=?, avatar_url=?, updated_at=? WHERE id=?`,
-			email, displayName, avatar, nowUnix, identity.userID,
-		); err != nil {
-			return User{}, false, err
-		}
-		if _, err := tx.Exec(
-			`UPDATE user_identities SET email=?, username=?, display_name=?, avatar_url=?, updated_at=?
-			 WHERE provider='linuxdo' AND provider_user_id=?`,
-			email, profile.Username, displayName, avatar, nowUnix, providerID,
-		); err != nil {
-			return User{}, false, err
-		}
-		user, ok, err = loadUserByID(tx, identity.userID)
-		if err != nil {
-			return User{}, false, err
-		}
-		if !ok {
-			return User{}, false, errUserNotFound
-		}
-	} else {
-		created = true
-		user = User{
-			ID:          newUserID(),
-			Email:       email,
-			DisplayName: displayName,
-			AvatarURL:   avatar,
-			CreatedAt:   nowUnix,
-			UpdatedAt:   nowUnix,
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO users(id, email, display_name, avatar_url, disabled, created_at, updated_at)
-			 VALUES(?,?,?,?,?,?,?)`,
-			user.ID, user.Email, user.DisplayName, user.AvatarURL, 0, nowUnix, nowUnix,
-		); err != nil {
-			return User{}, false, err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO user_identities(provider, provider_user_id, user_id, email, username, display_name, avatar_url, created_at, updated_at)
-			 VALUES(?,?,?,?,?,?,?,?,?)`,
-			"linuxdo", providerID, user.ID, email, profile.Username, displayName, avatar, nowUnix, nowUnix,
-		); err != nil {
-			return User{}, false, err
-		}
-	}
-	if user.Disabled {
-		return User{}, false, errUserDisabled
-	}
-	if err := tx.Commit(); err != nil {
-		return User{}, false, err
-	}
-	return user, created, nil
+	return s.upsertOAuthUser("linuxdo", profile, true, now)
 }
 
 func (s *userStore) linuxDoIdentityExists(providerID string) (bool, error) {
-	_, ok, err := loadUserIdentity(s.db, "linuxdo", strings.TrimSpace(providerID))
-	return ok, err
+	return s.oauthIdentityExists("linuxdo", providerID)
 }
 
 func (s *userStore) get(id string) (User, bool, error) {

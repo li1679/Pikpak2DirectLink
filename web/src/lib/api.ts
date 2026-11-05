@@ -20,6 +20,8 @@ import type {
   LogEntry,
   LibraryEntry,
   LibraryDownloadLink,
+  OAuthProvider,
+  OAuthProviderRequest,
   CreateLibraryEntryRequest,
   ResolveHistoryDetail,
   ResolveHistorySummary,
@@ -109,6 +111,14 @@ export const api = {
     auth: {
       get: () => request<AuthSettingsResponse>('GET', '/api/settings/auth'),
       update: (body: UpdateAuthSettingsRequest) => request<AuthSettingsResponse>('PUT', '/api/settings/auth', body),
+    },
+    oauthProviders: {
+      list: () => request<{ providers: OAuthProvider[] }>('GET', '/api/settings/oauth/providers'),
+      create: (body: OAuthProviderRequest) => request<OAuthProvider>('POST', '/api/settings/oauth/providers', body),
+      update: (id: string, body: OAuthProviderRequest) =>
+        request<OAuthProvider>('PUT', `/api/settings/oauth/providers/${encodeURIComponent(id)}`, body),
+      remove: (id: string, expected_revision: number) =>
+        request<void>('DELETE', `/api/settings/oauth/providers/${encodeURIComponent(id)}`, { expected_revision }),
     },
     storage: {
       get: () => request<StorageStatusResponse>('GET', '/api/settings/storage'),
