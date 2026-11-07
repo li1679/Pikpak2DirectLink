@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
-import { Terminal, Trash2, Info, CheckCircle2, AlertTriangle, XCircle } from 'lucide-vue-next'
+import { Terminal, Trash2, Info, CheckCircle2, AlertTriangle, XCircle, RefreshCw } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import { api } from '../../lib/api'
@@ -8,6 +8,8 @@ import { toast } from '../../composables/useToast'
 import type { LogEntry, LogLevel } from '../../lib/types'
 
 const logs = ref<LogEntry[]>([])
+const error = ref('')
+const loading = ref(false)
 const listEl = ref<HTMLElement | null>(null)
 let lastId = 0
 let timer: number | undefined
@@ -27,9 +29,13 @@ function scrollToBottom(smooth = true) {
 }
 
 async function poll() {
-  if (stopped) return
+  if (stopped || loading.value) return
+  window.clearTimeout(timer)
+  loading.value = true
   try {
     const { logs: entries } = await api.logs.list(lastId)
+    if (stopped) return
+    error.value = ''
     if (entries.length) {
       for (const e of entries) if (e.id > lastId) lastId = e.id
       logs.value.push(...entries)
@@ -42,8 +48,12 @@ async function poll() {
       await nextTick()
       requestAnimationFrame(() => scrollToBottom(false))
     }
-  } catch { /* ignore transient */ }
-  timer = window.setTimeout(poll, 1500)
+  } catch (e: any) {
+    if (!stopped) error.value = e?.message || '读取日志失败'
+  } finally {
+    loading.value = false
+    if (!stopped) timer = window.setTimeout(poll, 1500)
+  }
 }
 
 async function clearLogs() {
@@ -70,6 +80,7 @@ onUnmounted(() => { stopped = true; if (timer) clearTimeout(timer) })
       </div>
       <PrimaryButton variant="line" size="sm" @click="clearLogs"><template #icon><Trash2 /></template>清理日志</PrimaryButton>
     </div>
+    <p v-if="error" class="error-block" role="alert">{{ error }} <button type="button" class="btn btn-line btn-sm" :disabled="loading" @click="poll"><RefreshCw />重试</button></p>
     <div ref="listEl" class="log-list">
       <TransitionGroup name="v-fade">
         <div v-for="log in logs" :key="log.id" class="log" :class="log.level">
@@ -81,7 +92,7 @@ onUnmounted(() => { stopped = true; if (timer) clearTimeout(timer) })
           </template>
         </div>
       </TransitionGroup>
-      <div v-if="!logs.length" class="empty"><Terminal /><p>暂无日志，解析任务运行后这里会实时显示。</p></div>
+      <div v-if="!logs.length && !error" class="empty"><Terminal /><p>{{ loading ? '正在读取日志…' : '暂无日志，解析任务运行后这里会实时显示。' }}</p></div>
     </div>
   </GlassCard>
 </template>

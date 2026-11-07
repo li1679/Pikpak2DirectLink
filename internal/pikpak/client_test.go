@@ -2,7 +2,6 @@ package pikpak
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -10,10 +9,10 @@ import (
 func TestStatusLoadsPersistedSession(t *testing.T) {
 	t.Parallel()
 
-	sessionFile := filepath.Join(t.TempDir(), "session.json")
+	store := &memorySessionStore{}
 
 	client := NewClient(Config{
-		SessionFile: sessionFile,
+		SessionStore: store,
 	})
 
 	client.authMu.Lock()
@@ -31,7 +30,7 @@ func TestStatusLoadsPersistedSession(t *testing.T) {
 	client.authMu.Unlock()
 
 	reloaded := NewClient(Config{
-		SessionFile: sessionFile,
+		SessionStore: store,
 	})
 
 	status := reloaded.Status()
@@ -52,13 +51,13 @@ func TestStatusLoadsPersistedSession(t *testing.T) {
 	}
 }
 
-func TestLogoutRemovesSessionFile(t *testing.T) {
+func TestLogoutClearsPersistedSession(t *testing.T) {
 	t.Parallel()
 
-	sessionFile := filepath.Join(t.TempDir(), "session.json")
+	store := &memorySessionStore{}
 
 	client := NewClient(Config{
-		SessionFile: sessionFile,
+		SessionStore: store,
 	})
 
 	client.authMu.Lock()

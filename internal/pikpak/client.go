@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -57,7 +56,6 @@ var (
 type Config struct {
 	Username       string
 	Password       string
-	SessionFile    string
 	SessionStore   SessionStore
 	RootFolderName string
 	RequestTimeout time.Duration
@@ -155,7 +153,7 @@ func (c *Client) Status() SessionStatus {
 	return SessionStatus{
 		Ready:     loggedIn || hasCredentials,
 		LoggedIn:  loggedIn,
-		Persisted: loggedIn && (c.config.SessionStore != nil || c.config.SessionFile != ""),
+		Persisted: loggedIn && c.config.SessionStore != nil,
 		Username:  strings.TrimSpace(c.config.Username),
 	}
 }
@@ -200,7 +198,6 @@ func (c *Client) Logout() error {
 	c.deviceID = ""
 	c.sessionLoaded = true
 	sessionStore := c.config.SessionStore
-	sessionFile := c.config.SessionFile
 	c.authMu.Unlock()
 
 	c.resetRootFolder()
@@ -210,12 +207,6 @@ func (c *Client) Logout() error {
 			return err
 		}
 		return nil
-	}
-	if sessionFile == "" {
-		return nil
-	}
-	if err := os.Remove(sessionFile); err != nil && !os.IsNotExist(err) {
-		return err
 	}
 	return nil
 }
@@ -932,18 +923,10 @@ func (c *Client) currentUserID() string {
 }
 
 func (c *Client) loadSessionLocked() error {
-	var (
-		data []byte
-		err  error
-	)
-	if c.config.SessionStore != nil {
-		data, err = c.config.SessionStore.Load()
-	} else {
-		if c.config.SessionFile == "" {
-			return os.ErrNotExist
-		}
-		data, err = os.ReadFile(c.config.SessionFile)
+	if c.config.SessionStore == nil {
+		return os.ErrNotExist
 	}
+	data, err := c.config.SessionStore.Load()
 	if err != nil {
 		return err
 	}
@@ -967,7 +950,7 @@ func (c *Client) loadSessionLocked() error {
 }
 
 func (c *Client) saveSessionLocked() error {
-	if c.config.SessionStore == nil && c.config.SessionFile == "" {
+	if c.config.SessionStore == nil {
 		return nil
 	}
 
@@ -984,18 +967,7 @@ func (c *Client) saveSessionLocked() error {
 	if err != nil {
 		return err
 	}
-	if c.config.SessionStore != nil {
-		return c.config.SessionStore.Save(data)
-	}
-
-	dir := filepath.Dir(c.config.SessionFile)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-
-	return os.WriteFile(c.config.SessionFile, data, 0o600)
+	return c.config.SessionStore.Save(data)
 }
 
 func (c *Client) resetRootFolder() {

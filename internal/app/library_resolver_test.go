@@ -56,7 +56,7 @@ func TestLibraryJobFieldsSurviveEncryptedPersistenceAndIndependentClone(t *testi
 		if err := store.create(job); err != nil {
 			t.Fatal(err)
 		}
-		loaded, ok, err := store.get(job.ID, resolveJobOwnerAdmin, "", now)
+		loaded, ok, err := store.get(job.ID, now)
 		if err != nil || !ok || loaded.LibraryDiscovery != discovery || !reflect.DeepEqual(loaded.LibraryTarget, job.LibraryTarget) {
 			t.Fatalf("library job persistence: job=%#v, ok=%v, err=%v", loaded, ok, err)
 		}
@@ -77,21 +77,21 @@ func TestLibraryJobFieldsSurviveEncryptedPersistenceAndIndependentClone(t *testi
 	}
 }
 
-func TestLibraryHTTPAuthAndUnknownPublicToken(t *testing.T) {
+func TestLibraryLocalHTTPAndUnknownToken(t *testing.T) {
 	s := newTestServer(t)
 	for _, tc := range []struct {
 		method, path string
 		status       int
 	}{
-		{http.MethodGet, "/api/library", http.StatusUnauthorized},
-		{http.MethodPost, "/api/library", http.StatusUnauthorized},
+		{http.MethodGet, "/api/library", http.StatusOK},
+		{http.MethodPost, "/api/library", http.StatusBadRequest},
 		{http.MethodGet, "/d/short", http.StatusNotFound},
 		{http.MethodGet, "/d/", http.StatusNotFound},
 		{http.MethodGet, "/d/invalid/nested", http.StatusNotFound},
 		{http.MethodHead, "/d/" + strings.Repeat("a", 64), http.StatusNotFound},
 	} {
 		rec := httptest.NewRecorder()
-		s.Handler().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		s.Handler().ServeHTTP(rec, localRequest(tc.method, tc.path))
 		if rec.Code != tc.status {
 			t.Fatalf("%s %s status=%d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
 		}
@@ -199,10 +199,10 @@ func newLibraryResolverTestServer(t *testing.T) (*Server, *libraryShareTestClien
 	durable := newSQLJobStore(db, cipher)
 	s := &Server{config: Config{DBFile: dbPath, ResolveTimeout: 5 * time.Second, RequestTimeout: time.Second,
 		ShareParseTimeout: 3 * time.Second, ShareURLTimeout: 3 * time.Second, SharePollInterval: time.Millisecond,
-		PollInterval: time.Millisecond, PublicBaseURL: "https://library.example"},
+		PollInterval: time.Millisecond, PublicBaseURL: "http://localhost"},
 		db: db, secrets: cipher, library: library, accounts: pool, accountStore: pool.store,
 		jobs: newJobStore(100, durable), durableJobs: durable, tempCleanups: newProxyTempCleanupStore(db, cipher),
-		logs: newLogStore(100), authSessions: newAuthSessionStore(), mux: http.NewServeMux(), restartCh: make(chan struct{})}
+		logs: newLogStore(100), mux: http.NewServeMux(), restartCh: make(chan struct{})}
 	s.admission = newJobAdmission(s.jobs)
 	s.resolver = newResolveQueue(5*time.Second, 5*time.Second, 1, s.failJob)
 	go s.resolver.run()
@@ -356,7 +356,7 @@ func TestLibraryMagnetDiscoveryThenLazyDownloadUsesNewAccountLocalFileID(t *test
 
 func libraryTestRequest(s *Server, method, token string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(method, "https://library.example/d/"+token, nil)
+	req := localRequest(method, "/d/"+token)
 	req.Header.Set("Range", "bytes=10-19")
 	s.Handler().ServeHTTP(rec, req)
 	return rec
@@ -404,7 +404,7 @@ func TestLibraryShareDiscoveryAndLazyDownload(t *testing.T) {
 	if used := s.accounts.List()[0].TrafficUsed; used != 20 {
 		t.Fatalf("download charged %d bytes, want one resolution of 20 bytes", used)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/d/"+token+"?format=json", nil)
+	request := localRequest(http.MethodGet, "/d/"+token+"?format=json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, request)
 	var payload map[string]string

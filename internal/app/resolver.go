@@ -8,19 +8,13 @@ import (
 	"time"
 )
 
-// Job-resolution priorities. Higher numbers are dispatched first; within a
-// priority, dispatch stays FIFO. A resume continuation (the user already waited
-// a turn and just picked a file) outranks an admin queue-jump, which in turn
-// outranks an ordinary user submission.
+// Normal work is FIFO; a selected-file continuation resumes first.
 const (
-	priorityUser   = 0
-	priorityAdmin  = 1
-	priorityResume = 2
+	priorityNormal = 0
+	priorityResume = 1
 )
 
-// maxResolveConcurrency caps how many jobs an admin can run in parallel, so a
-// fat-fingered value can't spawn an unbounded number of goroutines all hammering
-// PikPak at once.
+// maxResolveConcurrency prevents accidental unbounded PikPak requests.
 const maxResolveConcurrency = 32
 
 var errResolveQueueClosed = errors.New("resolve queue is closed")
@@ -33,16 +27,9 @@ type queueEntry struct {
 	run      func(ctx context.Context)
 }
 
-// resolveQueue meters link resolution so the system only ever drives PikPak for
-// a bounded number of jobs at a time (which keeps it under PikPak's rate-control
-// radar), while still letting admin submissions jump the line and reporting
-// queue positions back to callers.
-//
-// A single dispatcher goroutine drains the queue, spawning up to `concurrency`
-// worker goroutines. With concurrency == 1 it behaves exactly like the original
-// serial worker. The admin can change concurrency live; the dispatcher simply
-// stops starting new jobs once the running set reaches the limit and resumes
-// when a slot frees (or when the limit is raised).
+// resolveQueue runs a bounded number of link resolutions and reports queue
+// positions. Concurrency can be changed live; running work keeps its slot until
+// it finishes, then the dispatcher applies the new limit.
 //
 // Each job runs under a hard timeout; if it exceeds the budget it is abandoned
 // and the next job starts. The budget is shorter while serial (snappy

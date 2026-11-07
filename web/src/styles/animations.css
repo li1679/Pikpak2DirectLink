@@ -111,7 +111,7 @@
 .v-veil-enter-from,
 .v-veil-leave-to { opacity: 0; }
 
-/* list transitions (results, accounts, cdks, logs) */
+/* list transitions (results, accounts, logs) */
 .v-list-enter-active { transition: opacity var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-out); }
 .v-list-leave-active { transition: opacity var(--t-fast) var(--ease), transform var(--t-fast) var(--ease); position: absolute; width: 100%; }
 .v-list-enter-from { opacity: 0; transform: translateY(10px); }

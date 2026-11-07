@@ -94,7 +94,7 @@ func TestCreateBatchJobRejectsTooManyLinks(t *testing.T) {
 		lines[i] = resourceLineSpec{raw: "magnet:?xt=urn:btih:test", clean: "magnet:?xt=urn:btih:test"}
 	}
 	s := &Server{}
-	if _, status, _ := s.createBatchJob(lines, "direct", "", "", priorityAdmin, "https://host"); status != 400 {
+	if _, status, _ := s.createBatchJob(lines, "direct", "", priorityNormal, "http://localhost"); status != 400 {
 		t.Fatalf("status = %d, want 400", status)
 	}
 }
@@ -278,8 +278,8 @@ func TestBatchChildDoneRecordsGenericFailure(t *testing.T) {
 	if failure.Label != "link 1" {
 		t.Fatalf("label = %q", failure.Label)
 	}
-	if failure.Error != genericUserJobError {
-		t.Fatalf("error = %q, want generic user-safe error", failure.Error)
+	if failure.Error != "解析失败，请在日志中查看详情。" {
+		t.Fatalf("error = %q, want concise diagnostic hint", failure.Error)
 	}
 	if strings.Contains(failure.Error, "@") || strings.Contains(failure.Error, "alice") {
 		t.Fatalf("failure leaked account detail: %q", failure.Error)

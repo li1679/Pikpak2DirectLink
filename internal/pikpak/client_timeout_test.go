@@ -28,7 +28,6 @@ func TestContextDeadlineDetection(t *testing.T) {
 // TestHTTPClientNoGlobalTimeout 测试 HTTP Client 不应设置全局超时
 func TestHTTPClientNoGlobalTimeout(t *testing.T) {
 	cfg := Config{
-		SessionFile:    "",
 		RootFolderName: "test",
 		RequestTimeout: 20 * time.Millisecond,
 	}
@@ -68,7 +67,6 @@ func TestDoJSONUsesRequestTimeoutInsideLongParentDeadline(t *testing.T) {
 // TestWaitForFileDownloadURLTimeout 测试直链等待超时机制
 func TestWaitForFileDownloadURLTimeout(t *testing.T) {
 	cfg := Config{
-		SessionFile:    "",
 		RootFolderName: "test",
 		RequestTimeout: 20 * time.Millisecond,
 	}

@@ -93,7 +93,7 @@ func TestExpireSelectionJobsMarksTimedOutJobsTerminal(t *testing.T) {
 	jobs := newJobStore(10)
 	now := time.Now().UTC()
 	job := &Job{
-		ID: "selection", UserID: "user", Status: JobSelectionRequired, Stage: StageResultSelection,
+		ID: "selection", Status: JobSelectionRequired, Stage: StageResultSelection,
 		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
 	}
 	if err := jobs.create(job); err != nil {
@@ -112,7 +112,7 @@ func TestExpiredSelectionSnapshotDoesNotFailResumedJob(t *testing.T) {
 	now := time.Now().UTC()
 	cutoff := now.Add(-selectionRequiredTimeout)
 	job := &Job{
-		ID: "selection-race", UserID: "user", Status: JobSelectionRequired, Stage: StageResultSelection,
+		ID: "selection-race", Status: JobSelectionRequired, Stage: StageResultSelection,
 		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
 	}
 	if err := jobs.create(job); err != nil {

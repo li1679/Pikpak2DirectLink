@@ -199,39 +199,20 @@ func TestProxyErrorsDoNotExposeInternalDetails(t *testing.T) {
 	}
 }
 
-func TestLegacyCDKJobProxyUsesPersistedCapability(t *testing.T) {
+func TestProxyRejectsMissingAndUnknownCapability(t *testing.T) {
 	server := &Server{jobs: newJobStore(10)}
-	legacyDirect := &Job{
-		ID:      "legacy-cdk-direct",
-		CDKCode: "LEGACY-DIRECT",
-		Status:  JobCompleted,
-		Result: &JobResult{
-			File:      DownloadItem{ID: "legacy-file"},
-			DirectURL: "https://example.com/direct",
-		},
+	if err := server.jobs.create(&Job{ID: "job", Status: JobCompleted,
+		Result: &JobResult{File: DownloadItem{ID: "file"}, DirectURL: "https://example.com/direct", ProxyToken: "stored"}}); err != nil {
+		t.Fatal(err)
 	}
-	if err := server.jobs.create(legacyDirect); err != nil {
-		t.Fatalf("create legacy job: %v", err)
-	}
-	req := httptest.NewRequest(http.MethodGet, "/proxy/legacy-cdk-direct", nil)
-	req.SetPathValue("id", legacyDirect.ID)
-	rec := httptest.NewRecorder()
-	server.handleProxy(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("legacy direct-only proxy status = %d body=%s, want 403", rec.Code, rec.Body.String())
-	}
-
-	admin := &Job{ID: "admin"}
-	if !server.jobAllowsProxy(admin) {
-		t.Fatal("admin job unexpectedly lost proxy access")
-	}
-	legacyProxy := &Job{
-		ID:      "legacy-cdk-proxy",
-		CDKCode: "LEGACY-PROXY",
-		Result:  &JobResult{ProxyURL: "/proxy/legacy-cdk-proxy?token=stored", ProxyToken: "stored"},
-	}
-	if !server.jobAllowsProxy(legacyProxy) {
-		t.Fatal("legacy job with a persisted proxy capability was denied")
+	for _, suffix := range []string{"", "?token=unknown"} {
+		req := localRequest(http.MethodGet, "/proxy/job"+suffix)
+		req.SetPathValue("id", "job")
+		rec := httptest.NewRecorder()
+		server.handleProxy(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
 	}
 }
 
@@ -952,7 +933,7 @@ func TestProxyTempCleanupFailureDelaysRetry(t *testing.T) {
 			return errors.New("delete failed")
 		},
 	}
-	store := newProxyTempCleanupStore(db)
+	store := newProxyTempCleanupStore(db, newTestSecretCipher(t, bytes.Repeat([]byte{0x55}, secretKeySize)))
 	if err := store.record("job-cleanup", "acct", []string{"temp-file"}, now.Add(-time.Minute), now.Add(-time.Hour)); err != nil {
 		t.Fatalf("record cleanup: %v", err)
 	}

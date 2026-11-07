@@ -1,6 +1,9 @@
 package app
 
 import (
+	"errors"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -12,14 +15,9 @@ type Config struct {
 	PublicBaseURL              string
 	DataEncryptionKey          string
 	DataEncryptionPreviousKeys []string
-	AccessPassword             string
 	Username                   string
 	Password                   string
 	RootFolderName             string
-	SessionFile                string
-	AccountsFile               string
-	AccountSessionDir          string
-	AuthFile                   string
 	DBFile                     string
 	BackupDir                  string
 	BackupInterval             time.Duration
@@ -30,8 +28,6 @@ type Config struct {
 	ParallelTimeout            time.Duration
 	ResolveConcurrency         int
 	PollInterval               time.Duration
-	UpdateRepo                 string
-	UpdateCheckPeriod          time.Duration
 	ShareParseTimeout          time.Duration // 分享链接解析超时
 	ShareURLTimeout            time.Duration // 分享文件直链获取超时
 	SharePollInterval          time.Duration // 分享文件直链轮询间隔
@@ -48,15 +44,10 @@ func LoadConfig() Config {
 		PublicBaseURL:              strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
 		DataEncryptionKey:          os.Getenv("DATA_ENCRYPTION_KEY"),
 		DataEncryptionPreviousKeys: commaSeparatedEnv("DATA_ENCRYPTION_PREVIOUS_KEYS"),
-		AccessPassword:             os.Getenv("ACCESS_PASSWORD"),
 		Username:                   strings.TrimSpace(os.Getenv("PIKPAK_USERNAME")),
 		Password:                   os.Getenv("PIKPAK_PASSWORD"),
 		RootFolderName:             envOrDefault("PIKPAK_ROOT_FOLDER", "Pikpak2DirectLink"),
-		SessionFile:                envOrDefault("PIKPAK_SESSION_FILE", "data/pikpak-session.json"),
-		AccountsFile:               envOrDefault("PIKPAK_ACCOUNTS_FILE", "data/pikpak-accounts.json"),
-		AccountSessionDir:          envOrDefault("PIKPAK_ACCOUNT_SESSION_DIR", "data/accounts"),
-		AuthFile:                   envOrDefault("ACCESS_AUTH_FILE", "data/auth.json"),
-		DBFile:                     envOrDefault("DB_FILE", "data/pikpak.db"),
+		DBFile:                     envOrDefault("DB_FILE", "data/personal.db"),
 		BackupDir:                  envOrDefault("BACKUP_DIR", "data/backups"),
 		BackupInterval:             positiveDurationOrDefault("BACKUP_INTERVAL", defaultBackupInterval),
 		BackupRetention:            positiveIntOrDefault("BACKUP_RETENTION", defaultBackupRetention),
@@ -66,8 +57,6 @@ func LoadConfig() Config {
 		ParallelTimeout:            positiveDurationOrDefault("PARALLEL_QUEUE_TIMEOUT", 2*time.Minute),
 		ResolveConcurrency:         intOrDefault("RESOLVE_CONCURRENCY", 1),
 		PollInterval:               positiveDurationOrDefault("POLL_INTERVAL", 5*time.Second),
-		UpdateRepo:                 strings.TrimSpace(os.Getenv("UPDATE_REPO")),
-		UpdateCheckPeriod:          nonNegativeDurationOrDefault("UPDATE_CHECK_INTERVAL", 6*time.Hour),
 		ShareParseTimeout:          positiveDurationOrDefault("SHARE_PARSE_TIMEOUT", 60*time.Second),
 		ShareURLTimeout:            positiveDurationOrDefault("SHARE_URL_TIMEOUT", 60*time.Second),
 		SharePollInterval:          positiveDurationOrDefault("SHARE_POLL_INTERVAL", 3*time.Second),
@@ -90,11 +79,37 @@ func (c Config) IsConfigured() bool {
 	return c.Username != "" && c.Password != ""
 }
 
-// HasFixedPassword reports whether an access password was pinned via the
-// ACCESS_PASSWORD environment variable. When set it overrides the first-visitor
-// setup flow.
-func (c Config) HasFixedPassword() bool {
-	return strings.TrimSpace(c.AccessPassword) != ""
+// ValidateLocal keeps this personal application on the local machine.
+func (c Config) ValidateLocal() error {
+	host, port, err := net.SplitHostPort(c.Addr)
+	if err != nil || !isLoopbackHost(host) {
+		return errors.New("ADDR must use a loopback IP address or localhost with an explicit port")
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 0 || n > 65535 {
+		return errors.New("ADDR must include a valid numeric port")
+	}
+	if c.PublicBaseURL != "" {
+		u, err := url.Parse(c.PublicBaseURL)
+		if err != nil || u.Scheme != "http" || !isLoopbackHost(u.Hostname()) || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+			return errors.New("PUBLIC_BASE_URL must be a local HTTP origin")
+		}
+		if u.Port() != "" {
+			port, err := strconv.Atoi(u.Port())
+			if err != nil || port < 1 || port > 65535 {
+				return errors.New("PUBLIC_BASE_URL has an invalid port")
+			}
+		}
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func envOrDefault(key, fallback string) string {
@@ -103,23 +118,6 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func nonNegativeDurationOrDefault(key string, fallback time.Duration) time.Duration {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		return fallback
-	}
-
-	if parsed, err := time.ParseDuration(value); err == nil && parsed >= 0 {
-		return parsed
-	}
-
-	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
-		return time.Duration(seconds) * time.Second
-	}
-
-	return fallback
 }
 
 func intOrDefault(key string, fallback int) int {

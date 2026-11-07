@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -27,6 +26,8 @@ import (
 //go:embed web/dist
 var webFS embed.FS
 
+const resourceParseErrorThreshold = 2
+
 type Server struct {
 	config               Config
 	accounts             *AccountPool
@@ -35,30 +36,15 @@ type Server struct {
 	durableJobs          *sqlJobStore
 	resolver             *resolveQueue
 	logs                 *logStore
-	authSessions         adminSessionStore
-	creds                adminCredentialStore
-	authLimiter          *authLimiter
-	setupBootstrapToken  string
-	setupBootstrapUntil  time.Time
 	secrets              *SecretCipher
-	appSecrets           *appSecretStore
-	legacyBackup         *migrationBackup
-	updater              *updater
 	backups              *backupManager
 	storageLock          *storageFileLock
 	db                   *sql.DB
-	cdk                  *cdkStore
-	users                *userStore
 	settings             *settingsStore
-	history              *resolveHistoryStore
 	library              *libraryStore
 	libraryDownloadsMu   sync.Mutex
 	libraryDownloads     map[string]*libraryDownload
 	tempCleanups         *proxyTempCleanupStore
-	oauthStates          *oauthStateStore
-	oauthProviders       *oauthProviderStore
-	gateHTML             []byte
-	userHTML             []byte
 	mux                  *http.ServeMux
 	batchMu              sync.Mutex
 	batches              map[string]*batchState
@@ -73,12 +59,10 @@ type Server struct {
 	premiumRefreshWG     sync.WaitGroup
 	healthCancel         context.CancelFunc
 	healthDone           chan struct{}
-	historyCancel        context.CancelFunc
-	historyDone          chan struct{}
+	jobCleanupCancel     context.CancelFunc
+	jobCleanupDone       chan struct{}
 	backupCancel         context.CancelFunc
 	backupDone           chan struct{}
-	updaterCancel        context.CancelFunc
-	updaterDone          chan struct{}
 	restartOnce          sync.Once
 	restartCh            chan struct{}
 	closeOnce            sync.Once
@@ -89,26 +73,12 @@ type Server struct {
 	nowFunc              func() time.Time
 }
 
-const (
-	resourceParseErrorThreshold = 2
-	setupBootstrapTTL           = 30 * time.Minute
-	setupBootstrapHeader        = "X-Setup-Token"
-)
-
 type configResponse struct {
 	Configured            bool   `json:"configured"`
 	AccountCount          int    `json:"account_count"`
 	FailedAccountCount    int    `json:"failed_account_count"`
 	AvailableAccountCount int    `json:"available_account_count"`
 	RootFolder            string `json:"root_folder"`
-	AuthRequired          bool   `json:"auth_required"`
-	Authenticated         bool   `json:"authenticated"`
-	PasswordFixed         bool   `json:"password_fixed"`
-}
-
-type authStatusResponse struct {
-	Configured    bool `json:"configured"`
-	Authenticated bool `json:"authenticated"`
 }
 
 type createJobRequest struct {
@@ -128,16 +98,10 @@ type loginRequest struct {
 	TrafficLimitGB int    `json:"traffic_limit_gb"`
 }
 
-type authLoginRequest struct {
-	Password string `json:"password"`
-}
-
-type changePasswordRequest struct {
-	CurrentPassword string `json:"current_password"`
-	NewPassword     string `json:"new_password"`
-}
-
 func NewServer(cfg Config) (*Server, error) {
+	if err := cfg.ValidateLocal(); err != nil {
+		return nil, err
+	}
 	secretCipher, err := NewSecretCipher(cfg.DataEncryptionKey, cfg.DataEncryptionPreviousKeys)
 	if err != nil {
 		return nil, fmt.Errorf("configure data encryption: %w", err)
@@ -152,33 +116,10 @@ func NewServer(cfg Config) (*Server, error) {
 			_ = storageLock.Close()
 		}
 	}()
-	if cfg.DBFile != ":memory:" {
-		if err := recoverInterruptedStorageRestore(cfg); err != nil {
-			return nil, fmt.Errorf("recover interrupted storage restore: %w", err)
-		}
-	}
-	migrationRecorded, err := storageMigrationRecorded(cfg.DBFile)
-	if err != nil {
-		return nil, fmt.Errorf("inspect storage migration: %w", err)
-	}
-	var legacyBackup *migrationBackup
-	if !migrationRecorded {
-		legacyBackup, err = prepareLegacyMigrationBackup(cfg, time.Now())
-		if err != nil {
-			return nil, fmt.Errorf("prepare storage migration backup: %w", err)
-		}
+	if err := recoverInterruptedStorageRestore(cfg); err != nil {
+		return nil, fmt.Errorf("recover interrupted storage restore: %w", err)
 	}
 	staticFiles, err := fs.Sub(webFS, "web/dist")
-	if err != nil {
-		return nil, err
-	}
-
-	gateHTML, err := fs.ReadFile(staticFiles, "gate.html")
-	if err != nil {
-		return nil, err
-	}
-
-	userHTML, err := fs.ReadFile(staticFiles, "user.html")
 	if err != nil {
 		return nil, err
 	}
@@ -205,25 +146,12 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("initialize file library: %w", err)
 	}
-	if err := appSecrets.migrateLinuxDoSecret(settings); err != nil {
-		return nil, fmt.Errorf("migrate LinuxDo client secret: %w", err)
-	}
-	legacyBackup, err = migrateLegacyStorage(db, cfg, secretCipher, legacyBackup, time.Now())
-	if err != nil {
-		return nil, fmt.Errorf("migrate legacy storage: %w", err)
-	}
-	oauthProviders, err := newOAuthProviderStore(db, secretCipher)
-	if err != nil {
-		return nil, fmt.Errorf("initialize OAuth providers: %w", err)
-	}
 	accountStore := newAccountStore(db, secretCipher)
 	if err := accountStore.RotateSecrets(); err != nil {
 		return nil, fmt.Errorf("rotate PikPak account secrets: %w", err)
 	}
 
 	accounts, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   cfg.AccountsFile,
-		SessionDir:     cfg.AccountSessionDir,
 		RootFolderName: cfg.RootFolderName,
 		RequestTimeout: cfg.RequestTimeout,
 		Store:          accountStore,
@@ -232,34 +160,9 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	if cfg.IsConfigured() && !accounts.HasAccounts() {
-		if err := accounts.AddBootstrap(cfg.Username, cfg.Password, cfg.SessionFile); err != nil {
+		if err := accounts.AddBootstrap(cfg.Username, cfg.Password); err != nil {
 			return nil, err
 		}
-	}
-
-	creds, err := newDatabaseCredentialStore(db)
-	if err != nil {
-		return nil, err
-	}
-	authSessions := newDatabaseAuthSessionStore(db, time.Now)
-	// A password pinned via ACCESS_PASSWORD takes precedence and disables the
-	// first-visitor setup flow.
-	if cfg.HasFixedPassword() {
-		if !creds.Verify(cfg.AccessPassword) {
-			if err := creds.Set(cfg.AccessPassword); err != nil {
-				return nil, err
-			}
-			authSessions.invalidateAll()
-		}
-	}
-	setupBootstrapToken := ""
-	setupBootstrapUntil := time.Time{}
-	if !creds.HasPassword() {
-		setupBootstrapToken, err = generateSessionID()
-		if err != nil {
-			return nil, fmt.Errorf("generate initial setup token: %w", err)
-		}
-		setupBootstrapUntil = time.Now().Add(setupBootstrapTTL)
 	}
 	sqlJobs := newSQLJobStore(db, secretCipher)
 	if err := sqlJobs.RotateSecrets(); err != nil {
@@ -270,10 +173,6 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if _, err := sqlJobs.markNonterminalInterrupted(time.Now()); err != nil {
 		return nil, fmt.Errorf("mark interrupted resolve jobs: %w", err)
-	}
-	users := newUserStore(db)
-	if _, err := users.reconcileQuotaReservations(time.Now()); err != nil {
-		return nil, fmt.Errorf("reconcile user quota reservations: %w", err)
 	}
 	tempCleanups := newProxyTempCleanupStore(db, secretCipher)
 	if err := tempCleanups.RotateSecrets(); err != nil {
@@ -288,39 +187,25 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	server := &Server{
-		config:              cfg,
-		accounts:            accounts,
-		accountStore:        accountStore,
-		jobs:                newJobStore(maxGlobalNonterminalJobs+100, sqlJobs),
-		durableJobs:         sqlJobs,
-		logs:                newLogStore(500),
-		authSessions:        authSessions,
-		creds:               creds,
-		authLimiter:         newAuthLimiter(),
-		setupBootstrapToken: setupBootstrapToken,
-		setupBootstrapUntil: setupBootstrapUntil,
-		secrets:             secretCipher,
-		appSecrets:          appSecrets,
-		legacyBackup:        legacyBackup,
-		backups:             backups,
-		storageLock:         storageLock,
-		db:                  db,
-		cdk:                 newCDKStore(db),
-		users:               users,
-		settings:            settings,
-		history:             newResolveHistoryStore(db, sqlJobs),
-		library:             library,
-		libraryDownloads:    make(map[string]*libraryDownload),
-		tempCleanups:        tempCleanups,
-		oauthStates:         newOAuthStateStore(),
-		oauthProviders:      oauthProviders,
-		gateHTML:            gateHTML,
-		userHTML:            userHTML,
-		mux:                 http.NewServeMux(),
-		batches:             make(map[string]*batchState),
-		proxyFailures:       make(map[string]proxyFailureCacheEntry),
-		proxyLimit:          newDefaultProxyLimiter(),
-		restartCh:           make(chan struct{}),
+		config:           cfg,
+		accounts:         accounts,
+		accountStore:     accountStore,
+		jobs:             newJobStore(maxGlobalNonterminalJobs+100, sqlJobs),
+		durableJobs:      sqlJobs,
+		logs:             newLogStore(500),
+		secrets:          secretCipher,
+		backups:          backups,
+		storageLock:      storageLock,
+		db:               db,
+		settings:         settings,
+		library:          library,
+		libraryDownloads: make(map[string]*libraryDownload),
+		tempCleanups:     tempCleanups,
+		mux:              http.NewServeMux(),
+		batches:          make(map[string]*batchState),
+		proxyFailures:    make(map[string]proxyFailureCacheEntry),
+		proxyLimit:       newDefaultProxyLimiter(),
+		restartCh:        make(chan struct{}),
 	}
 	server.admission = newJobAdmission(server.jobs)
 
@@ -329,14 +214,8 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, err
 	}
 
-	// The updater logs into the shared console with no job context.
-	server.updater = newUpdater(cfg.UpdateRepo, cfg.RequestTimeout, func(level LogLevel, message string, details ...string) {
-		server.logJob(level, "", message, details...)
-	})
-	server.updater.restart = server.requestRestart
-
-	// Meter link resolution through the resolve queue. Concurrency is admin-
-	// controllable and persisted in the settings table; the config value only
+	// Meter link resolution through the resolve queue. Concurrency is
+	// configurable and persisted in settings; the config value only
 	// seeds the initial default the first time the server runs. Concurrency > 1
 	// switches the per-job budget from the snappy serial timeout to the longer
 	// parallel one.
@@ -359,25 +238,15 @@ func NewServer(cfg Config) (*Server, error) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		assetServer.ServeHTTP(w, r)
 	}))
-	server.mux.Handle("GET /", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server.mux.Handle("GET /{$}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveEmbeddedFile(w, r, staticFiles, "index.html", "text/html; charset=utf-8")
 	}))
-	server.mux.HandleFunc("GET /api/auth/status", server.handleAuthStatus)
-	server.mux.HandleFunc("POST /api/auth/setup", server.handleAuthSetup)
-	server.mux.HandleFunc("POST /api/auth/login", server.handleAuthLogin)
-	server.mux.HandleFunc("POST /api/auth/logout", server.handleAuthLogout)
-	server.mux.HandleFunc("POST /api/auth/password", server.handleChangePassword)
+	server.mux.Handle("GET /app-icon.png", assetServer)
 	server.mux.HandleFunc("GET /api/config", server.handleConfig)
 	server.mux.HandleFunc("GET /api/settings", server.handleGetSettings)
 	server.mux.HandleFunc("PUT /api/settings", server.handleUpdateSettings)
-	server.mux.HandleFunc("GET /api/settings/auth", server.handleGetAuthSettings)
-	server.mux.HandleFunc("PUT /api/settings/auth", server.handleUpdateAuthSettings)
 	server.mux.HandleFunc("GET /api/settings/storage", server.handleGetStorageSettings)
 	server.mux.HandleFunc("POST /api/settings/storage/backups", server.handleCreateStorageBackup)
-	server.mux.HandleFunc("DELETE /api/settings/storage/migration-backup", server.handleDeleteMigrationBackup)
-	server.mux.HandleFunc("GET /api/update", server.handleUpdateStatus)
-	server.mux.HandleFunc("POST /api/update/check", server.handleUpdateCheck)
-	server.mux.HandleFunc("POST /api/update/install", server.handleUpdateInstall)
 	server.mux.HandleFunc("GET /api/logs", server.handleListLogs)
 	server.mux.HandleFunc("DELETE /api/logs", server.handleClearLogs)
 	server.mux.HandleFunc("GET /api/accounts", server.handleListAccounts)
@@ -390,35 +259,6 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("POST /api/jobs", server.handleCreateJob)
 	server.mux.HandleFunc("GET /api/jobs/{id}", server.handleGetJob)
 	server.mux.HandleFunc("POST /api/jobs/{id}/select", server.handleSelectItem)
-	server.mux.HandleFunc("GET /api/users", server.handleAdminListUsers)
-	server.mux.HandleFunc("GET /api/users/{userID}", server.handleAdminGetUser)
-	server.mux.HandleFunc("POST /api/users/{userID}/subscriptions", server.handleAdminCreateSubscription)
-	server.mux.HandleFunc("PATCH /api/users/{userID}/subscriptions/{subscriptionID}", server.handleAdminUpdateSubscription)
-	server.mux.HandleFunc("POST /api/users/{userID}/subscriptions/{subscriptionID}/terminate", server.handleAdminTerminateSubscription)
-
-	// Admin-only CDK management (behind the access gate).
-	server.mux.HandleFunc("GET /api/cdks", server.handleListCDKs)
-	server.mux.HandleFunc("POST /api/cdks", server.handleCreateCDKs)
-	server.mux.HandleFunc("PATCH /api/cdks/{code}", server.handleUpdateCDK)
-	server.mux.HandleFunc("DELETE /api/cdks/{code}", server.handleDeleteCDK)
-
-	// Public user portal. The handlers enforce user-session validity themselves.
-	server.mux.Handle("GET /u", http.HandlerFunc(server.handleUserPortal))
-	server.mux.HandleFunc("GET /api/u/auth/config", server.handleUserAuthConfig)
-	server.mux.HandleFunc("GET /api/u/auth/linuxdo/start", server.handleLinuxDoAuthStart)
-	server.mux.HandleFunc("GET /api/u/auth/linuxdo/callback", server.handleLinuxDoAuthCallback)
-	server.registerOAuthProviderRoutes()
-	server.mux.HandleFunc("POST /api/u/auth/email/register", server.handleEmailRegister)
-	server.mux.HandleFunc("POST /api/u/auth/email/login", server.handleEmailLogin)
-	server.mux.HandleFunc("POST /api/u/login", server.handleEmailLogin)
-	server.mux.HandleFunc("GET /api/u/status", server.handleUserStatus)
-	server.mux.HandleFunc("POST /api/u/logout", server.handleUserLogout)
-	server.mux.HandleFunc("POST /api/u/cdks/redeem", server.handleUserRedeemCDK)
-	server.mux.HandleFunc("POST /api/u/jobs", server.handleUserCreateJob)
-	server.mux.HandleFunc("GET /api/u/jobs/{id}", server.handleUserGetJob)
-	server.mux.HandleFunc("POST /api/u/jobs/{id}/select", server.handleUserSelectItem)
-	server.mux.HandleFunc("GET /api/u/history", server.handleUserHistoryList)
-	server.mux.HandleFunc("GET /api/u/history/{id}", server.handleUserHistoryGet)
 
 	server.mux.HandleFunc("GET /proxy/{id}", server.handleProxy)
 	server.mux.HandleFunc("HEAD /proxy/{id}", server.handleProxy)
@@ -427,11 +267,8 @@ func NewServer(cfg Config) (*Server, error) {
 	server.mux.HandleFunc("GET /d/{token}", server.handleLibraryDownload)
 	server.mux.HandleFunc("HEAD /d/{token}", server.handleLibraryDownload)
 
-	// Poll GitHub Releases in the background so the UI can surface an available
-	// update. Installs are always user-initiated.
-	server.startUpdaterMonitor()
 	server.startAccountHealthMonitor()
-	server.startResolveHistoryCleanup()
+	server.startJobCleanup()
 	server.startBackupMonitor()
 
 	closeDBOnError = false
@@ -440,12 +277,11 @@ func NewServer(cfg Config) (*Server, error) {
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.authMiddleware(s.mux)
+	return localOnlyMiddleware(s.mux)
 }
 
-// RestartRequested is closed when the process must restart after an online
-// update or an indeterminate storage commit. The process owner should
-// gracefully stop HTTP and then Close.
+// RestartRequested is closed after an indeterminate storage commit. The process
+// owner should gracefully stop HTTP and then Close before starting again.
 func (s *Server) RestartRequested() <-chan struct{} {
 	if s == nil {
 		return nil
@@ -458,19 +294,6 @@ func (s *Server) requestRestart() {
 		return
 	}
 	s.restartOnce.Do(func() { close(s.restartCh) })
-}
-
-func (s *Server) startUpdaterMonitor() {
-	if s == nil || s.updater == nil || s.config.UpdateCheckPeriod <= 0 {
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	s.updaterCancel = cancel
-	s.updaterDone = make(chan struct{})
-	go func() {
-		defer close(s.updaterDone)
-		s.updater.runPeriodicCheck(ctx, s.config.UpdateCheckPeriod)
-	}()
 }
 
 // Close releases server-held resources such as the database handle. It is safe
@@ -486,14 +309,11 @@ func (s *Server) Close() error {
 			s.premiumRefreshCancel()
 		}
 		s.premiumRefreshMu.Unlock()
-		if s.updaterCancel != nil {
-			s.updaterCancel()
-		}
 		if s.healthCancel != nil {
 			s.healthCancel()
 		}
-		if s.historyCancel != nil {
-			s.historyCancel()
+		if s.jobCleanupCancel != nil {
+			s.jobCleanupCancel()
 		}
 		if s.backupCancel != nil {
 			s.backupCancel()
@@ -501,7 +321,7 @@ func (s *Server) Close() error {
 		if s.resolver != nil {
 			s.resolver.shutdown()
 		}
-		for _, done := range []<-chan struct{}{s.updaterDone, s.healthDone, s.historyDone, s.backupDone} {
+		for _, done := range []<-chan struct{}{s.healthDone, s.jobCleanupDone, s.backupDone} {
 			if done != nil {
 				<-done
 			}
@@ -522,331 +342,8 @@ func (s *Server) Close() error {
 	return s.closeErr
 }
 
-// authenticated reports whether the request carries a valid session cookie.
-func (s *Server) authenticated(r *http.Request) bool {
-	cookie, err := r.Cookie("session")
-	return err == nil && s.authSessions.validate(cookie.Value)
-}
-
-// authMiddleware enforces the access gate for every request. Unauthenticated
-// browsers never receive the application shell or its scripts — they are served
-// a self-contained gate page instead — so the gate cannot be bypassed by
-// editing the DOM in devtools. Only the auth endpoints (needed to log in) and
-// the per-job proxy links (protected by their own tokens) stay open.
-func (s *Server) authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
-		if path == "/api/auth/status" ||
-			path == "/api/auth/setup" ||
-			path == "/api/auth/login" ||
-			strings.HasPrefix(path, "/assets/") ||
-			path == "/u" ||
-			strings.HasPrefix(path, "/u/") ||
-			strings.HasPrefix(path, "/api/u/") ||
-			strings.HasPrefix(path, "/proxy/") ||
-			strings.HasPrefix(path, "/d/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if s.authenticated(r) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// API calls get a clean 401 so the front-end can react; everything else
-		// (the app shell, scripts, styles, unknown paths) gets the gate page.
-		if strings.HasPrefix(path, "/api/") {
-			writeError(w, http.StatusUnauthorized, "authentication required")
-			return
-		}
-
-		s.serveGate(w)
-	})
-}
-
-func (s *Server) serveGate(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(s.gateHTML)
-}
-
-func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, authStatusResponse{
-		Configured:    s.creds.HasPassword(),
-		Authenticated: s.authenticated(r),
-	})
-}
-
-// handleAuthSetup lets the local operator holding the startup token set the
-// admin password. Once a password exists this endpoint is closed permanently.
-func (s *Server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
-	if s.creds.HasPassword() {
-		writeError(w, http.StatusConflict, "password has already been set")
-		return
-	}
-	if !isLocalSetupRequest(r) {
-		writeError(w, http.StatusForbidden, "initial password setup is only available from localhost")
-		return
-	}
-	if !s.validSetupBootstrapToken(r.Header.Get(setupBootstrapHeader)) {
-		writeError(w, http.StatusForbidden, "initial setup token is invalid or expired")
-		return
-	}
-
-	var req authLoginRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if len(strings.TrimSpace(req.Password)) < 6 {
-		writeError(w, http.StatusBadRequest, "password must be at least 6 characters")
-		return
-	}
-
-	if err := s.creds.SetInitial(req.Password); err != nil {
-		writeError(w, http.StatusConflict, "password has already been set")
-		return
-	}
-
-	if err := s.issueSession(w); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "configured"})
-}
-
-func (s *Server) validSetupBootstrapToken(provided string) bool {
-	if s == nil || s.setupBootstrapToken == "" || !s.now().Before(s.setupBootstrapUntil) {
-		return false
-	}
-	return constantTimeTokenEqual(s.setupBootstrapToken, strings.TrimSpace(provided))
-}
-
-// InitialSetupURL returns the short-lived, localhost-only URL used to transfer
-// the in-memory bootstrap token from the server console into the gate page.
-// The token lives in the fragment so browsers never send it in an HTTP URL.
-func (s *Server) InitialSetupURL() string {
-	if s == nil || s.creds == nil || s.creds.HasPassword() || !s.validSetupBootstrapToken(s.setupBootstrapToken) {
-		return ""
-	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(s.config.Addr))
-	if err != nil || port == "" {
-		return ""
-	}
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	hostIP := net.ParseIP(host)
-	switch {
-	case host == "" || hostIP != nil && hostIP.IsUnspecified():
-		host = "127.0.0.1"
-	case strings.EqualFold(host, "localhost"):
-	case hostIP == nil || !hostIP.IsLoopback():
-		return ""
-	}
-	return "http://" + net.JoinHostPort(host, port) + "/#setup_token=" + s.setupBootstrapToken
-}
-
-func (s *Server) InitialSetupRequired() bool {
-	return s != nil && s.creds != nil && !s.creds.HasPassword()
-}
-
-func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
-	if !s.creds.HasPassword() {
-		writeError(w, http.StatusConflict, "password has not been set yet")
-		return
-	}
-
-	var req authLoginRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	attempt := authAttemptForRequest(r, "admin")
-	admission, retryAfter, admitted := s.authLimiter.admit(attempt, s.now())
-	if !admitted {
-		writeAuthRateLimit(w, retryAfter)
-		return
-	}
-	defer func() { admission.cancel(s.now()) }()
-
-	verified, err := s.creds.VerifyContext(r.Context(), req.Password)
-	if errors.Is(err, errPasswordHashBusy) {
-		writePasswordHashBusy(w)
-		return
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to authenticate")
-		return
-	}
-	if !verified {
-		admission.fail(s.now())
-		writeError(w, http.StatusUnauthorized, "incorrect password")
-		return
-	}
-	admission.succeed(s.now())
-
-	if err := s.issueSession(w); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "authenticated"})
-}
-
-func isLocalSetupRequest(r *http.Request) bool {
-	if r == nil {
-		return false
-	}
-	for _, header := range []string{
-		"Forwarded",
-		"Via",
-		"X-Forwarded-For",
-		"X-Forwarded-Host",
-		"X-Forwarded-Port",
-		"X-Forwarded-Proto",
-		"X-Real-IP",
-	} {
-		if strings.TrimSpace(r.Header.Get(header)) != "" {
-			return false
-		}
-	}
-	remoteHost, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err != nil {
-		remoteHost = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
-	}
-	remoteIP := net.ParseIP(strings.Trim(remoteHost, "[]"))
-	if remoteIP == nil || !remoteIP.IsLoopback() {
-		return false
-	}
-
-	host := strings.TrimSpace(r.Host)
-	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-		host = parsedHost
-	}
-	host = strings.Trim(strings.TrimSpace(host), "[]")
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
-	hostIP := net.ParseIP(host)
-	return hostIP != nil && hostIP.IsLoopback()
-}
-
-func (s *Server) issueSession(w http.ResponseWriter) error {
-	sessionID, err := s.authSessions.create()
-	if err != nil {
-		return err
-	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    sessionID,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   s.secureCookies(),
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   86400 * 30,
-		Expires:  time.Now().Add(adminSessionMaxAge),
-	})
-	return nil
-}
-
-func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie("session")
-	if err == nil {
-		s.authSessions.delete(cookie.Value)
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session",
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   s.secureCookies(),
-		SameSite: http.SameSiteStrictMode,
-		MaxAge:   -1,
-	})
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "logged out"})
-}
-
-func (s *Server) secureCookies() bool {
-	parsed, err := url.Parse(strings.TrimSpace(s.config.PublicBaseURL))
-	return err == nil && strings.EqualFold(parsed.Scheme, "https")
-}
-
-// handleChangePassword lets an authenticated admin rotate the access password.
-// It is registered outside the auth middleware allowlist, so the caller is
-// already known to hold a valid session. The current password must still be
-// confirmed, and changing it logs out every other session.
-func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
-	if s.config.HasFixedPassword() {
-		writeError(w, http.StatusConflict, "访问密码由 ACCESS_PASSWORD 环境变量固定，无法在网页内修改")
-		return
-	}
-	if !s.creds.HasPassword() {
-		writeError(w, http.StatusConflict, "尚未设置访问密码")
-		return
-	}
-
-	var req changePasswordRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	if !s.creds.Verify(req.CurrentPassword) {
-		writeError(w, http.StatusUnauthorized, "当前密码不正确")
-		return
-	}
-
-	newPassword := strings.TrimSpace(req.NewPassword)
-	if len(newPassword) < 6 {
-		writeError(w, http.StatusBadRequest, "新密码至少 6 位")
-		return
-	}
-	if s.creds.Verify(req.NewPassword) {
-		writeError(w, http.StatusBadRequest, "新密码不能与当前密码相同")
-		return
-	}
-
-	if err := s.creds.Set(req.NewPassword); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// Invalidate every session (other devices are logged out), then mint a fresh
-	// one for this client so the caller stays signed in.
-	s.authSessions.invalidateAll()
-	if err := s.issueSession(w); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	s.logJob(LogSuccess, "", "访问密码已修改，其它设备的登录已失效")
-	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
-}
-
-func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.authStatusResponse(s.authenticated(r)))
-}
-
-func (s *Server) handleUpdateStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.updater.snapshot())
-}
-
-func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout)
-	defer cancel()
-	writeJSON(w, http.StatusOK, s.updater.check(ctx))
-}
-
-func (s *Server) handleUpdateInstall(w http.ResponseWriter, _ *http.Request) {
-	if err := s.updater.startInstall(); err != nil {
-		writeError(w, http.StatusConflict, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, s.updater.snapshot())
+func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.configSnapshot())
 }
 
 func (s *Server) handleListLogs(w http.ResponseWriter, r *http.Request) {
@@ -1057,7 +554,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	// (multi-file resolution still pauses for a manual selection).
 	lines := splitResourceLineSpecs(req.Input)
 	if len(lines) > 1 {
-		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, "", priorityAdmin, s.baseURL(r))
+		parent, status, msg := s.createBatchJob(lines, req.Mode, req.PassCode, priorityNormal, s.baseURL(r))
 		if status != 0 {
 			if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
 				w.Header().Set("Retry-After", "30")
@@ -1111,7 +608,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		job.PassCode = passCode
 	}
 
-	createErr := s.admission.withCapacity("", 1, func() error { return s.jobs.create(job) })
+	createErr := s.admission.withCapacity(1, func() error { return s.jobs.create(job) })
 	if createErr != nil {
 		var limitErr *jobAdmissionError
 		if errors.As(createErr, &limitErr) {
@@ -1123,7 +620,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logJob(LogInfo, job.ID, "解析任务已创建", "来源："+string(kind))
-	if err := s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
+	if err := s.resolver.enqueue(job.ID, priorityNormal, func(ctx context.Context) {
 		s.processJob(ctx, job.ID)
 	}); err != nil {
 		if errors.Is(err, errResolveQueueFull) {
@@ -1147,7 +644,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
-		expired, err := s.jobDetailsExpired(jobID, resolveJobOwnerAdmin, resolveJobOwnerAdmin)
+		expired, err := s.jobDetailsExpired(jobID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to read job")
 			return
@@ -1163,11 +660,11 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
-func (s *Server) jobDetailsExpired(id, ownerType, ownerID string) (bool, error) {
+func (s *Server) jobDetailsExpired(id string) (bool, error) {
 	if s == nil || s.durableJobs == nil {
 		return false, nil
 	}
-	record, ok, err := s.durableJobs.getRecord(id, ownerType, ownerID, s.now())
+	record, ok, err := s.durableJobs.getRecord(id, s.now())
 	return ok && !record.DetailsAvailable, err
 }
 
@@ -1351,35 +848,6 @@ func (s *Server) clearProxyFailure(jobID, token string) {
 	}
 }
 
-// jobAllowsProxy reports whether a job may expose proxy links. Admin jobs always
-// may. User jobs use their persisted permission snapshot. Historical CDK jobs
-// predate that snapshot, so retain access only when their persisted result proves
-// that a proxy capability was originally issued.
-func (s *Server) jobAllowsProxy(job *Job) bool {
-	if job == nil {
-		return true
-	}
-	if job.UserID != "" {
-		return job.ProxyAllowed
-	}
-	if job.CDKCode != "" {
-		if job.ProxyAllowed || resultHasProxyCapability(job.Result) {
-			return true
-		}
-		for i := range job.Results {
-			if resultHasProxyCapability(&job.Results[i]) {
-				return true
-			}
-		}
-		return false
-	}
-	return true
-}
-
-func resultHasProxyCapability(result *JobResult) bool {
-	return result != nil && (strings.TrimSpace(result.ProxyURL) != "" || strings.TrimSpace(result.ProxyToken) != "")
-}
-
 func proxyResultAccountID(job *Job, result *JobResult) string {
 	if result != nil && strings.TrimSpace(result.AccountID) != "" {
 		return strings.TrimSpace(result.AccountID)
@@ -1482,28 +950,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, proxyInvalidLinkError)
 		return
 	}
-	// Defense in depth: a user job created without 中转 permission cannot pull
-	// files through the proxy even with a valid token.
-	if !s.jobAllowsProxy(job) {
-		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
-		return
-	}
 
-	// A job may carry a single result (admin path) or many (user batch). The
-	// proxy token in the URL selects which file this request is for.
+	// The per-file token selects a result from single-file or batch jobs.
 	providedToken := strings.TrimSpace(r.URL.Query().Get("token"))
 	result := job.resultForToken(providedToken)
 	if result == nil {
-		// Fall back to the single result only when it has no token of its own, so
-		// legacy single-file proxy links without a token keep working.
-		if job.Result != nil && job.Result.ProxyToken == "" {
-			result = job.Result
-		} else {
-			writeError(w, http.StatusForbidden, proxyInvalidLinkError)
-			return
-		}
-	}
-	if job.CDKCode != "" && !job.ProxyAllowed && !resultHasProxyCapability(result) {
 		writeError(w, http.StatusForbidden, proxyInvalidLinkError)
 		return
 	}
@@ -2191,27 +1642,6 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 			return
 		}
 
-		var selectionLimitErr *jobAdmissionError
-		if errors.As(err, &selectionLimitErr) && selectionLimitErr.Selection {
-			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
-			s.finishAccountAttempt(jobID, account.ID, "failed", selectionCapacityUserError)
-			s.logJob(LogWarn, jobID, "user selection capacity reached", selectionLimitErr.Error())
-			s.failJobWithCode(jobID, errors.New(selectionCapacityUserError), "selection_capacity")
-			return
-		}
-
-		// A user quota refusal is deterministic and not the account's fault:
-		// retrying on other accounts would repeat the expensive transfer and hit
-		// the same refusal. Fail the job terminally instead.
-		var userOverdraw errUserQuotaOverdraw
-		if errors.As(err, &userOverdraw) || errors.Is(err, errUserQuotaExhausted) {
-			s.handleAccountStatePersistence("mark-available", account.ID, s.accounts.MarkAvailable(account.ID))
-			s.finishAccountAttempt(jobID, account.ID, "failed", err.Error())
-			s.logJob(LogWarn, jobID, "resolved file exceeds remaining user quota", err.Error())
-			s.failJob(jobID, err)
-			return
-		}
-
 		// A resource taken down by PikPak (copyright / harmful content / no longer
 		// available) is also deterministic and not the account's fault. Every
 		// account would hit the same refusal, so don't blacklist the account —
@@ -2593,58 +2023,22 @@ func (s *Server) finishWithItems(ctx context.Context, jobID string, account Acco
 		s.logJob(LogWarn, jobID, fmt.Sprintf("检测到 %d 个可用文件，需要选择目标文件", len(items)), sampleItemDetail(items))
 		return s.requestSelection(jobID, StageResultSelection, "choose which file should become the final link", items, account.ID)
 	}
-	if err := s.jobQuotaError(jobID, items[0]); err != nil {
-		return err
-	}
 	return s.completeJob(ctx, jobID, account, items[0])
-}
-
-// jobQuotaError returns a typed quota error when a user's resolved file is
-// larger than the remaining quota. Admin jobs do not consume user quota.
-func (s *Server) jobQuotaError(jobID string, item DownloadItem) error {
-	job := mustJob(s.jobs.get(jobID))
-	if job.UserID == "" {
-		return nil
-	}
-	size := parseBytes(item.Size)
-	if s.users != nil {
-		return s.users.hasQuota(job.UserID, size, job.Mode == "proxy", s.now())
-	}
-	return nil
-}
-
-func isQuotaRefusalError(err error) bool {
-	if err == nil {
-		return false
-	}
-	var userOverdraw errUserQuotaOverdraw
-	if errors.As(err, &userOverdraw) {
-		return true
-	}
-	return errors.Is(err, errUserQuotaExhausted)
 }
 
 func (s *Server) requestSelection(jobID string, stage JobStage, message string, items []DownloadItem, accountID string) error {
 	sortItems(items)
-	job := mustJob(s.jobs.get(jobID))
-	err := s.admission.withSelection(job.UserID, jobID, func() error {
-		_, err := s.jobs.update(jobID, func(job *Job) error {
-			job.Status = JobSelectionRequired
-			job.Stage = stage
-			job.Message = message
-			job.Error = ""
-			job.Items = items
-			if accountID != "" {
-				job.AccountID = accountID
-			}
-			return nil
-		})
-		return err
+	_, err := s.jobs.update(jobID, func(job *Job) error {
+		job.Status = JobSelectionRequired
+		job.Stage = stage
+		job.Message = message
+		job.Error = ""
+		job.Items = items
+		if accountID != "" {
+			job.AccountID = accountID
+		}
+		return nil
 	})
-	var limitErr *jobAdmissionError
-	if errors.As(err, &limitErr) {
-		return err
-	}
 	return wrapJobPersistenceError("persist job selection", err)
 }
 
@@ -2657,10 +2051,6 @@ func (s *Server) resolveExistingFile(ctx context.Context, jobID string, item Dow
 	}
 
 	if err := s.completeJob(ctx, jobID, account, item); err != nil {
-		if isQuotaRefusalError(err) {
-			s.failJob(jobID, err)
-			return
-		}
 		if s.handleJobPersistenceFailure(jobID, account, err, false) {
 			return
 		}
@@ -2680,10 +2070,6 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 	}
 
 	if err := s.completeJobBatch(ctx, jobID, account, items); err != nil {
-		if isQuotaRefusalError(err) {
-			s.failJob(jobID, err)
-			return
-		}
 		if s.handleJobPersistenceFailure(jobID, account, err, false) {
 			return
 		}
@@ -2693,54 +2079,20 @@ func (s *Server) resolveExistingFiles(ctx context.Context, jobID string, items [
 }
 
 func (s *Server) completeJob(ctx context.Context, jobID string, account AccountRuntime, item DownloadItem) error {
-	job := mustJob(s.jobs.get(jobID))
-	reservedBytes := int64(0)
-	if job.UserID != "" && s.users != nil {
-		reservedBytes = parseBytes(item.Size)
-		if reservedBytes > 0 {
-			if err := s.users.reserveQuota(jobID, job.UserID, reservedBytes, job.Mode == "proxy", s.now()); err != nil {
-				return err
-			}
-		}
-		defer func() {
-			if reservedBytes > 0 {
-				if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
-					s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
-					s.requestRestart()
-				}
-			}
-		}()
-	}
 	result, err := s.resolveFileLink(ctx, jobID, account, item)
 	if err != nil {
 		return err
 	}
 
 	size := parseBytes(result.File.Size)
-	if job.UserID != "" && s.users != nil && size != reservedBytes {
-		if reservedBytes > 0 {
-			if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
-				return fmt.Errorf("adjust quota reservation: %w", err)
-			}
-			reservedBytes = 0
-		}
-		if size > 0 {
-			if err := s.users.reserveQuota(jobID, job.UserID, size, job.Mode == "proxy", s.now()); err != nil {
-				return err
-			}
-			reservedBytes = size
-		}
-	}
 	if err := s.finalizeCompletedJob(jobID, account, result, nil, size, item.ID); err != nil {
 		if errors.Is(err, errJobAlreadyCompleted) {
 			return nil
 		}
 		return err
 	}
-	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, "解析任务完成", "文件："+firstNonEmpty(result.File.Name, result.File.Path))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(size))
-	s.saveResolveHistory(jobID)
 	return nil
 }
 
@@ -2777,16 +2129,12 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 		DirectURL: directURL,
 		AccountID: account.ID,
 	}
-	// Only mint a proxy (中转) link when the job is permitted to use it: admin
-	// jobs always, user jobs only when their subscription grants it.
-	if s.jobAllowsProxy(job) {
-		proxyToken, err := newJobID()
-		if err != nil {
-			return nil, fmt.Errorf("generate secure proxy token: %w", err)
-		}
-		result.ProxyURL = strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken
-		result.ProxyToken = proxyToken
+	proxyToken, err := newDownloadToken()
+	if err != nil {
+		return nil, fmt.Errorf("generate secure proxy token: %w", err)
 	}
+	result.ProxyURL = strings.TrimRight(job.BaseURL, "/") + "/proxy/" + jobID + "?token=" + proxyToken
+	result.ProxyToken = proxyToken
 	result.applyPreferredURL(job.Mode)
 	if expiresAt := file.ExpireAt(); !expiresAt.IsZero() {
 		result.ExpiresAt = expiresAt.Format(time.RFC3339)
@@ -2794,35 +2142,9 @@ func (s *Server) resolveFileLink(ctx context.Context, jobID string, account Acco
 	return result, nil
 }
 
-// completeJobBatch resolves a direct link for each selected file, accumulates
-// them into Job.Results, cleans up once, and settles the summed user quota.
-// It backs the user multi-select flow. A single GetFile failure aborts the
-// whole batch (the job fails) rather than delivering a partial set.
+// completeJobBatch resolves selected files and commits their combined account
+// traffic and temporary-resource cleanup in one transaction.
 func (s *Server) completeJobBatch(ctx context.Context, jobID string, account AccountRuntime, items []DownloadItem) error {
-	// Reserve the summed size before doing any
-	// expensive link resolution. The user-select path is already pre-gated in
-	// applyItemsSelection; this also covers the batch-child path, which resolves
-	// every file unattended and would otherwise overdraw.
-	job := mustJob(s.jobs.get(jobID))
-	reservedBytes := int64(0)
-	if job.UserID != "" && s.users != nil {
-		for _, item := range items {
-			reservedBytes += parseBytes(item.Size)
-		}
-		if reservedBytes > 0 {
-			if err := s.users.reserveQuota(jobID, job.UserID, reservedBytes, job.Mode == "proxy", s.now()); err != nil {
-				return err
-			}
-		}
-		defer func() {
-			if reservedBytes > 0 {
-				if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
-					s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
-					s.requestRestart()
-				}
-			}
-		}()
-	}
 
 	results := make([]JobResult, 0, len(items))
 	var totalSize int64
@@ -2834,20 +2156,6 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		results = append(results, *result)
 		totalSize += parseBytes(result.File.Size)
 	}
-	if job.UserID != "" && s.users != nil && totalSize != reservedBytes {
-		if reservedBytes > 0 {
-			if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
-				return fmt.Errorf("adjust quota reservation: %w", err)
-			}
-			reservedBytes = 0
-		}
-		if totalSize > 0 {
-			if err := s.users.reserveQuota(jobID, job.UserID, totalSize, job.Mode == "proxy", s.now()); err != nil {
-				return err
-			}
-			reservedBytes = totalSize
-		}
-	}
 
 	fallbackIDs := downloadItemIDs(items)
 	if err := s.finalizeCompletedJob(jobID, account, nil, results, totalSize, fallbackIDs...); err != nil {
@@ -2856,10 +2164,8 @@ func (s *Server) completeJobBatch(ctx context.Context, jobID string, account Acc
 		}
 		return err
 	}
-	reservedBytes = 0
 	s.logJob(LogSuccess, jobID, fmt.Sprintf("解析任务完成，共 %d 个文件", len(results)))
 	s.logJob(LogInfo, jobID, "已计入下行流量", "账号："+account.Username, "大小："+formatTrafficLabel(totalSize))
-	s.saveResolveHistory(jobID)
 	return nil
 }
 
@@ -2915,30 +2221,13 @@ func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, resu
 		job.TempIDs = nil
 		return nil
 	}, func(tx *sql.Tx, job *Job) error {
-		if job.UserID != "" {
-			if s.users == nil {
-				return errors.New("user quota storage is not configured")
-			}
-			settledBytes, err := s.users.settleQuotaReservationTx(tx, jobID)
-			if err != nil {
-				return err
-			}
-			if settledBytes == 0 && chargedBytes > 0 {
-				// Compatibility backstop for pre-reservation callers and legacy tests.
-				if err := s.users.chargeIfEnoughTx(tx, job.UserID, chargedBytes, job.Mode == "proxy", now); err != nil {
-					return err
-				}
-			} else if settledBytes != chargedBytes {
-				return fmt.Errorf("quota reservation settled %d bytes, want %d", settledBytes, chargedBytes)
-			}
-		}
 		if err := traffic.writeTx(tx); err != nil {
 			return err
 		}
 		return s.tempCleanups.recordTx(tx, jobID, account.ID, cleanupIDs, cleanupAfter, now)
 	})
 	if err != nil {
-		if errors.Is(err, errJobAlreadyCompleted) || isQuotaRefusalError(err) {
+		if errors.Is(err, errJobAlreadyCompleted) {
 			return err
 		}
 		return wrapJobPersistenceError("persist completed job", err)
@@ -3825,7 +3114,7 @@ func (s *Server) failJobWithCode(jobID string, cause error, failureCode string) 
 	if cause == nil {
 		cause = errors.New("resolve failed")
 	}
-	updated, err := s.jobs.update(jobID, func(job *Job) error {
+	_, err := s.jobs.update(jobID, func(job *Job) error {
 		job.Status = JobFailed
 		job.Stage = StageFailed
 		job.Message = ""
@@ -3838,31 +3127,17 @@ func (s *Server) failJobWithCode(jobID string, cause error, failureCode string) 
 		s.requestRestart()
 		return
 	}
-	if updated != nil && updated.UserID != "" && s.users != nil {
-		if _, err := s.users.releaseQuotaReservation(jobID); err != nil {
-			s.logJob(LogError, jobID, "quota reservation release failed", err.Error())
-			s.requestRestart()
-		}
-	}
 }
 
 func (s *Server) baseURL(r *http.Request) string {
 	if s.config.PublicBaseURL != "" {
 		return s.config.PublicBaseURL
 	}
-
 	scheme := "http"
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
-		scheme = forwarded
-	} else if r.TLS != nil {
+	if r.TLS != nil {
 		scheme = "https"
 	}
-
-	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
-	if host == "" {
-		host = r.Host
-	}
-	return scheme + "://" + host
+	return scheme + "://" + r.Host
 }
 
 func decodeJSON(r *http.Request, dst any) error {
@@ -3909,7 +3184,7 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func (s *Server) authStatusResponse(authenticated bool) configResponse {
+func (s *Server) configSnapshot() configResponse {
 	accounts := s.accounts.List()
 	failed := 0
 	available := 0
@@ -3929,9 +3204,6 @@ func (s *Server) authStatusResponse(authenticated bool) configResponse {
 		FailedAccountCount:    failed,
 		AvailableAccountCount: available,
 		RootFolder:            s.config.RootFolderName,
-		AuthRequired:          true,
-		Authenticated:         authenticated,
-		PasswordFixed:         s.config.HasFixedPassword(),
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,34 +15,23 @@ import (
 func TestAccountPoolListResetAndDelete(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	pool, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
-		RootFolderName: "Pikpak2DirectLink",
-		RequestTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("new pool: %v", err)
-	}
+	pool := newTrafficTestPool(t)
 
 	accountID := "acct_demo"
-	sessionFile := filepath.Join(dir, "sessions", accountID+".json")
 	pool.mu.Lock()
 	pool.accounts[accountID] = &accountState{
 		record: accountRecord{
-			ID:          accountID,
-			Username:    "demo@example.com",
-			Password:    "secret",
-			SessionFile: sessionFile,
-			Status:      AccountAvailable,
-			CreatedAt:   time.Now(),
-			UpdatedAt:   time.Now(),
+			ID:        accountID,
+			Username:  "demo@example.com",
+			Password:  "secret",
+			Status:    AccountAvailable,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
 		},
 		client: pikpak.NewClient(pikpak.Config{
 			Username:       "demo@example.com",
 			Password:       "secret",
-			SessionFile:    sessionFile,
+			SessionStore:   pool.store.SessionStore(accountID),
 			RootFolderName: "Pikpak2DirectLink",
 			RequestTimeout: time.Second,
 		}),
@@ -54,11 +43,8 @@ func TestAccountPoolListResetAndDelete(t *testing.T) {
 	}
 	pool.mu.Unlock()
 
-	if err := os.MkdirAll(filepath.Dir(sessionFile), 0o755); err != nil {
-		t.Fatalf("mkdir session dir: %v", err)
-	}
-	if err := os.WriteFile(sessionFile, []byte(`{}`), 0o600); err != nil {
-		t.Fatalf("write session file: %v", err)
+	if err := pool.store.SessionStore(accountID).Save([]byte(`{}`)); err != nil {
+		t.Fatal(err)
 	}
 
 	pool.MarkFailed(accountID, errors.New("login failed"))
@@ -84,12 +70,7 @@ func TestAccountPoolListResetAndDelete(t *testing.T) {
 		t.Fatalf("expected empty last error, got %q", summaries[0].LastError)
 	}
 
-	reloaded, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
-		RootFolderName: "Pikpak2DirectLink",
-		RequestTimeout: time.Second,
-	})
+	reloaded, err := NewAccountPool(pool.config)
 	if err != nil {
 		t.Fatalf("reload pool: %v", err)
 	}
@@ -103,46 +84,37 @@ func TestAccountPoolListResetAndDelete(t *testing.T) {
 	if len(reloaded.List()) != 0 {
 		t.Fatalf("expected empty pool after delete")
 	}
-	if _, err := os.Stat(sessionFile); !os.IsNotExist(err) {
-		t.Fatalf("expected session file to be removed, got %v", err)
+	if _, err := pool.store.SessionStore(accountID).Load(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected account session to be removed, got %v", err)
 	}
 }
 
-func TestAccountPoolBootstrapUsesLegacySessionFile(t *testing.T) {
+func TestAccountPoolBootstrapUsesEncryptedDatabase(t *testing.T) {
 	t.Parallel()
+	pool := newTrafficTestPool(t)
+	if err := pool.AddBootstrap("demo@example.com", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.AddBootstrap(" DEMO@example.com ", "different"); err != nil {
+		t.Fatal(err)
+	}
+	accounts := pool.List()
+	if len(accounts) != 1 || accounts[0].CredentialNextCheckAt == "" {
+		t.Fatalf("bootstrap accounts = %+v", accounts)
+	}
+	if strings.Contains(accounts[0].ID, "demo") {
+		t.Fatal("account ID exposes username")
+	}
+	records, err := pool.store.List()
+	if err != nil || len(records) != 1 || records[0].Password != "secret" {
+		t.Fatalf("bootstrap records = %+v, err=%v", records, err)
+	}
+	assertEncryptedColumn(t, pool.store.db, `SELECT password_encrypted FROM pikpak_accounts WHERE id=?`, accounts[0].ID, "secret")
+}
 
-	dir := t.TempDir()
-	legacySession := filepath.Join(dir, "pikpak-session.json")
-	pool, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
-		RootFolderName: "Pikpak2DirectLink",
-		RequestTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("new pool: %v", err)
-	}
-
-	if err := pool.AddBootstrap("demo@example.com", "secret", legacySession); err != nil {
-		t.Fatalf("bootstrap: %v", err)
-	}
-
-	runtime, ok := pool.Get(accountIDForUsername("demo@example.com"))
-	if !ok {
-		t.Fatalf("expected bootstrapped account")
-	}
-	if runtime.Client == nil {
-		t.Fatalf("expected client")
-	}
-
-	pool.mu.RLock()
-	defer pool.mu.RUnlock()
-	state := pool.accounts[accountIDForUsername("demo@example.com")]
-	if state.record.SessionFile != legacySession {
-		t.Fatalf("expected legacy session file %q, got %q", legacySession, state.record.SessionFile)
-	}
-	if state.record.CredentialNextCheckAt == "" {
-		t.Fatalf("expected bootstrapped account to be scheduled for credential check")
+func TestNewAccountPoolRequiresSQLite(t *testing.T) {
+	if _, err := NewAccountPool(AccountPoolConfig{}); err == nil {
+		t.Fatal("account pool accepted missing SQLite store")
 	}
 }
 
@@ -170,16 +142,7 @@ func TestAccountPoolEnsureCredentialScheduleBackfillsOldAccounts(t *testing.T) {
 func TestAccountPoolResolveOrder(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	pool, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
-		RootFolderName: "Pikpak2DirectLink",
-		RequestTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatalf("new pool: %v", err)
-	}
+	pool := newTrafficTestPool(t)
 
 	ids := []string{"a", "b", "c"}
 	pool.mu.Lock()
@@ -283,10 +246,9 @@ func TestAccountTrafficHelpers(t *testing.T) {
 
 func newTrafficTestPool(t *testing.T) *AccountPool {
 	t.Helper()
-	dir := t.TempDir()
+	db := openAccountStoreTestDatabase(t)
 	pool, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
+		Store:          newAccountStore(db, newTestSecretCipher(t, []byte("0123456789abcdef0123456789abcdef"))),
 		RootFolderName: "Pikpak2DirectLink",
 		RequestTimeout: time.Second,
 	})

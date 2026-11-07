@@ -11,10 +11,9 @@ import (
 )
 
 const (
-	restoreJournalVersion       = 1
-	restoreJournalFilename      = ".storage-restore-journal.json"
-	restoreJournalModeDatabase  = "database"
-	restoreJournalModeMigration = "migration"
+	restoreJournalVersion      = 1
+	restoreJournalFilename     = ".storage-restore-journal.json"
+	restoreJournalModeDatabase = "database"
 )
 
 type storageRestoreJournal struct {
@@ -117,7 +116,7 @@ func recoverInterruptedStorageRestore(cfg Config) error {
 	if err := json.Unmarshal(data, &journal); err != nil {
 		return fmt.Errorf("read restore journal %s: %w", journalPath, err)
 	}
-	if err := validateRestoreJournal(journal, cfg, databasePath); err != nil {
+	if err := validateRestoreJournal(journal, databasePath); err != nil {
 		return err
 	}
 	markerData, markerErr := os.ReadFile(restoreJournalCommitPath(journalPath))
@@ -162,7 +161,7 @@ func recoverInterruptedStorageRestore(cfg Config) error {
 	return removeRestoreJournal(journalPath)
 }
 
-func validateRestoreJournal(journal storageRestoreJournal, cfg Config, databasePath string) error {
+func validateRestoreJournal(journal storageRestoreJournal, databasePath string) error {
 	if journal.Version != restoreJournalVersion || strings.TrimSpace(journal.ID) == "" || len(journal.Operations) == 0 {
 		return errors.New("restore journal is incomplete")
 	}
@@ -172,7 +171,7 @@ func validateRestoreJournal(journal storageRestoreJournal, cfg Config, databaseP
 	if _, err := hex.DecodeString(journal.ID); err != nil {
 		return errors.New("restore journal has an invalid id")
 	}
-	if journal.Mode != restoreJournalModeDatabase && journal.Mode != restoreJournalModeMigration {
+	if journal.Mode != restoreJournalModeDatabase {
 		return errors.New("restore journal has an invalid mode")
 	}
 	journalDB, err := absoluteDatabasePath(journal.DatabasePath)
@@ -184,7 +183,7 @@ func validateRestoreJournal(journal storageRestoreJournal, cfg Config, databaseP
 		if !filepath.IsAbs(operation.Target) {
 			return errors.New("restore journal contains a relative target")
 		}
-		if err := validateRestoreJournalTarget(journal.Mode, cfg, databasePath, operation); err != nil {
+		if err := validateRestoreJournalTarget(databasePath, operation); err != nil {
 			return err
 		}
 		canonical, err := canonicalRestorePath(operation.Target)
@@ -210,7 +209,7 @@ func validateRestoreJournal(journal storageRestoreJournal, cfg Config, databaseP
 	return nil
 }
 
-func validateRestoreJournalTarget(mode string, cfg Config, databasePath string, operation storageRestoreJournalOperation) error {
+func validateRestoreJournalTarget(databasePath string, operation storageRestoreJournalOperation) error {
 	target, err := absoluteRestorePath(operation.Target)
 	if err != nil {
 		return err
@@ -224,27 +223,7 @@ func validateRestoreJournalTarget(mode string, cfg Config, databasePath string, 
 		}
 		return nil
 	}
-	if mode != restoreJournalModeMigration {
-		return errors.New("restore journal contains a non-database target")
-	}
-	fixed := map[string]string{
-		"admin_auth": cfg.AuthFile, "accounts": cfg.AccountsFile, "bootstrap_session": cfg.SessionFile,
-	}
-	if configured, ok := fixed[operation.Kind]; ok {
-		expected, err := absoluteRestorePath(configured)
-		if err != nil || !samePath(target, expected) {
-			return errors.New("restore journal legacy target is not allowed")
-		}
-		return nil
-	}
-	if operation.Kind != "account_session" {
-		return errors.New("restore journal contains an unknown target kind")
-	}
-	root, err := absoluteRestorePath(cfg.AccountSessionDir)
-	if err != nil {
-		return err
-	}
-	return validateRestoreContainment(root, target)
+	return errors.New("restore journal contains a non-database target")
 }
 
 func removeRestoreArtifact(path string) error {

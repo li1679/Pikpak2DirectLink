@@ -60,9 +60,9 @@ type childSpec struct {
 // createBatchJob validates every line, then creates a parent job plus one child
 // job per line. Children carry ResolveAll so they resolve every file unattended,
 // and are enqueued at the given priority so they fan out across the resolve queue
-// under the admin's concurrency limit. It returns the parent job, or an HTTP
-// status + message when a line cannot be recognized (status 0 means success).
-func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode, userID string, priority int, baseURL string) (*Job, int, string) {
+// under the configured concurrency limit. It returns an HTTP status and message
+// when admission fails (status 0 means success).
+func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode string, priority int, baseURL string) (*Job, int, string) {
 	if len(lines) > maxBatchLinks {
 		return nil, 400, fmt.Sprintf("too many links: maximum is %d per batch", maxBatchLinks)
 	}
@@ -93,23 +93,20 @@ func (s *Server) createBatchJob(lines []resourceLineSpec, mode, defaultPassCode,
 	var parent *Job
 	var status int
 	var message string
-	if err := s.admission.withCapacity(userID, len(specs), func() error {
-		parent, status, message = s.createBatchJobAdmitted(specs, cleanLines, rawLines, mode, userID, priority, baseURL)
+	if err := s.admission.withCapacity(len(specs), func() error {
+		parent, status, message = s.createBatchJobAdmitted(specs, cleanLines, rawLines, mode, priority, baseURL)
 		return nil
 	}); err != nil {
 		var limitErr *jobAdmissionError
 		if errors.As(err, &limitErr) {
-			if limitErr.Global || userID == "" {
-				return nil, http.StatusServiceUnavailable, "resolve service is at capacity"
-			}
-			return nil, http.StatusTooManyRequests, "too many active user jobs"
+			return nil, http.StatusServiceUnavailable, "resolve service is at capacity"
 		}
 		return nil, http.StatusInternalServerError, "failed to admit batch job"
 	}
 	return parent, status, message
 }
 
-func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines []string, mode, userID string, priority int, baseURL string) (*Job, int, string) {
+func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines []string, mode string, priority int, baseURL string) (*Job, int, string) {
 	now := time.Now()
 	parentID, err := newJobID()
 	if err != nil {
@@ -125,8 +122,6 @@ func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines 
 		Stage:         StageTransfer,
 		Message:       fmt.Sprintf("解析中：0/%d 条完成", len(specs)),
 		BaseURL:       baseURL,
-		UserID:        userID,
-		ProxyAllowed:  userID != "" && mode == "proxy",
 		Batch:         &BatchProgress{Total: len(specs)},
 		CreatedAt:     now,
 		UpdatedAt:     now,
@@ -155,22 +150,20 @@ func (s *Server) createBatchJobAdmitted(specs []childSpec, cleanLines, rawLines 
 			return nil, 500, "failed to generate a secure job ID"
 		}
 		child := &Job{
-			ID:           childID,
-			Kind:         spec.kind,
-			Mode:         mode,
-			Input:        spec.input,
-			PassCode:     spec.passCode,
-			Status:       JobQueued,
-			Stage:        StageTransfer,
-			Message:      "queued",
-			BaseURL:      baseURL,
-			UserID:       userID,
-			ProxyAllowed: userID != "" && mode == "proxy",
-			ParentID:     parentID,
-			ResolveAll:   true,
-			Share:        spec.share,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+			ID:         childID,
+			Kind:       spec.kind,
+			Mode:       mode,
+			Input:      spec.input,
+			PassCode:   spec.passCode,
+			Status:     JobQueued,
+			Stage:      StageTransfer,
+			Message:    "queued",
+			BaseURL:    baseURL,
+			ParentID:   parentID,
+			ResolveAll: true,
+			Share:      spec.share,
+			CreatedAt:  now,
+			UpdatedAt:  now,
 		}
 		if err := s.jobs.create(child); err != nil {
 			s.failJob(parentID, err)
@@ -291,16 +284,22 @@ func (s *Server) batchChildDone(parentID, childID, label string) {
 	if final {
 		s.removeBatch(parentID)
 		s.logJob(LogSuccess, parentID, fmt.Sprintf("批量解析完成，成功 %d/%d 条", succeeded, total))
-		s.saveResolveHistory(parentID)
 	}
 }
 
 func safeBatchFailureError(message string) string {
 	message = strings.TrimSpace(message)
-	if message == "" {
-		return genericUserJobError
+	if isBadResourceUserError(message) {
+		return badResourceParseUserError
 	}
-	return safeUserError(message)
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") || strings.Contains(message, "超时") {
+		return "解析超时，请稍后重试。"
+	}
+	if isResourceUnavailableMessage(lower) {
+		return friendlyPikPakMessage(message)
+	}
+	return "解析失败，请在日志中查看详情。"
 }
 
 // childResultPath is the in-link path of a resolved file, falling back to its

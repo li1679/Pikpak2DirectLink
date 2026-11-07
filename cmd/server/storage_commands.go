@@ -21,7 +21,7 @@ func runStorageCommandWithOutput(args []string, cfg app.Config, output io.Writer
 		return false, nil
 	}
 	if len(args) < 2 {
-		return true, errors.New("storage command requires restore-db or restore-migration")
+		return true, errors.New("storage command requires restore-db")
 	}
 
 	switch args[1] {
@@ -36,17 +36,6 @@ func runStorageCommandWithOutput(args []string, cfg app.Config, output io.Writer
 		}
 		printRestoreResult(output, result)
 		return true, nil
-	case "restore-migration":
-		backup, err := parseRestoreFlags("storage restore-migration", args[2:])
-		if err != nil {
-			return true, err
-		}
-		result, err := app.RestoreMigration(context.Background(), cfg, backup)
-		if err != nil {
-			return true, err
-		}
-		printRestoreResult(output, result)
-		return true, nil
 	default:
 		return true, fmt.Errorf("unknown storage command %q", args[1])
 	}
@@ -55,7 +44,7 @@ func runStorageCommandWithOutput(args []string, cfg app.Config, output io.Writer
 func parseRestoreFlags(name string, args []string) (string, error) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	backup := flags.String("backup", "", "backup file or directory")
+	backup := flags.String("backup", "", "standalone personal database backup file")
 	confirmed := flags.Bool("yes", false, "confirm destructive restore")
 	if err := flags.Parse(args); err != nil {
 		return "", fmt.Errorf("%s: %w", name, err)

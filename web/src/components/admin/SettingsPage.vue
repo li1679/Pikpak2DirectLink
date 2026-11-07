@@ -1,77 +1,59 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
-import { DatabaseBackup, Gauge, KeyRound, Lock, Mail, Save, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-vue-next'
+import { DatabaseBackup, Gauge, RefreshCw, Save } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
-import OAuthProvidersSettings from './OAuthProvidersSettings.vue'
 import { api } from '../../lib/api'
 import { toast } from '../../composables/useToast'
 import { formatBytes, formatDateTime, formatRelative } from '../../lib/format'
-import type { AuthSettingsResponse, SettingsResponse, StorageStatusResponse } from '../../lib/types'
+import type { SettingsResponse, StorageStatusResponse } from '../../lib/types'
 
-const props = defineProps<{ passwordFixed: boolean }>()
+const emit = defineEmits<{ (e: 'changed'): void }>()
 
 const settings = ref<SettingsResponse | null>(null)
+const settingsLoading = ref(false)
+const settingsErr = ref('')
 const concInput = ref(1)
 const timeoutInput = ref(60)
 const concErr = ref('')
 const concSaving = ref(false)
 
 const storage = ref<StorageStatusResponse | null>(null)
+const storageLoading = ref(false)
 const storageErr = ref('')
 const backupRunning = ref(false)
-const migrationDeleting = ref(false)
-const migrationDeleteConfirmed = ref(false)
 let storageRefreshTimer: number | undefined
 let storageMounted = true
 
-const pw = ref({ current: '', new: '', confirm: '' })
-const pwErr = ref('')
-const pwSaving = ref(false)
-
-const authSettings = ref<AuthSettingsResponse | null>(null)
-const authForm = ref({
-  email_login_enabled: true,
-  email_registration_enabled: false,
-})
-const authErr = ref('')
-const authSaving = ref(false)
-
 async function loadSettings() {
+  settingsLoading.value = true
+  settingsErr.value = ''
   try {
     settings.value = await api.settings.get()
     concInput.value = settings.value.concurrency
     timeoutInput.value = Math.max(1, Math.round(settings.value.task_timeout_seconds / 60))
   } catch (e: any) {
-    toast(e?.message || '加载设置失败', 'error')
-  }
-}
-
-async function loadAuthSettings() {
-  try {
-    authSettings.value = await api.settings.auth.get()
-    authForm.value = {
-      email_login_enabled: authSettings.value.email_login_enabled,
-      email_registration_enabled: authSettings.value.email_registration_enabled,
-    }
-  } catch (e: any) {
-    toast(e?.message || '加载用户登录设置失败', 'error')
+    settingsErr.value = e?.message || '加载设置失败'
+  } finally {
+    settingsLoading.value = false
   }
 }
 
 async function loadStorage() {
 	clearStorageRefresh()
 	storageErr.value = ''
+	storageLoading.value = true
 	try {
 		const payload = await api.settings.storage.get()
 		if (!storageMounted) return
 		storage.value = payload
-		if (!storage.value.migration?.backup_id) migrationDeleteConfirmed.value = false
 		if (storage.value.running) {
 			storageRefreshTimer = window.setTimeout(loadStorage, 1500)
 		}
 	} catch (e: any) {
 		storageErr.value = e?.message || '加载存储状态失败'
+	} finally {
+		storageLoading.value = false
 	}
 }
 
@@ -96,23 +78,6 @@ async function runBackup() {
   }
 }
 
-async function deleteMigrationBackup() {
-  const backupID = storage.value?.migration?.backup_id
-  if (!backupID || !migrationDeleteConfirmed.value) return
-  storageErr.value = ''
-  migrationDeleting.value = true
-  try {
-    await api.settings.storage.deleteMigrationBackup(backupID)
-    migrationDeleteConfirmed.value = false
-    toast('旧版迁移备份已删除', 'success')
-    await loadStorage()
-  } catch (e: any) {
-    storageErr.value = e?.message || '删除迁移备份失败'
-  } finally {
-    migrationDeleting.value = false
-  }
-}
-
 function backupStatusLabel(status?: string) {
   if (status === 'success') return '校验通过'
   if (status === 'failed') return '失败'
@@ -126,24 +91,6 @@ function backupIntervalLabel(seconds: number) {
   return Number.isInteger(hours) ? `${hours} 小时` : `${Math.round(hours * 10) / 10} 小时`
 }
 
-async function saveAuthSettings() {
-  if (!authSettings.value) return
-  authErr.value = ''
-  authSaving.value = true
-  try {
-    authSettings.value = await api.settings.auth.update({
-      email_login_enabled: authForm.value.email_login_enabled,
-      email_registration_enabled: authForm.value.email_registration_enabled,
-    })
-    toast('邮箱登录设置已保存', 'success')
-    await loadAuthSettings()
-  } catch (e: any) {
-    authErr.value = e?.message || '保存失败'
-  } finally {
-    authSaving.value = false
-  }
-}
-
 async function saveSettings() {
   concErr.value = ''
   if (!Number.isFinite(concInput.value) || concInput.value < 1 || concInput.value > 32) { concErr.value = '并发数需在 1–32 之间'; return }
@@ -152,6 +99,7 @@ async function saveSettings() {
   try {
     settings.value = await api.settings.update({ concurrency: concInput.value, task_timeout_minutes: timeoutInput.value })
     toast('设置已保存', 'success')
+    emit('changed')
   } catch (e: any) {
     concErr.value = e?.message || '保存失败'
   } finally {
@@ -159,24 +107,8 @@ async function saveSettings() {
   }
 }
 
-async function changePassword() {
-  pwErr.value = ''
-  if (pw.value.new.length < 6) { pwErr.value = '新密码至少 6 位'; return }
-  if (pw.value.new !== pw.value.confirm) { pwErr.value = '两次输入不一致'; return }
-  pwSaving.value = true
-  try {
-    await api.auth.password(pw.value.current, pw.value.new)
-    pw.value = { current: '', new: '', confirm: '' }
-    toast('密码已修改，其它设备需重新登录', 'success')
-  } catch (e: any) {
-    pwErr.value = e?.message || '修改失败'
-  } finally {
-    pwSaving.value = false
-  }
-}
-
 onMounted(async () => {
-	await Promise.all([loadSettings(), loadAuthSettings(), loadStorage()])
+	await Promise.all([loadSettings(), loadStorage()])
 })
 
 onUnmounted(() => {
@@ -194,10 +126,11 @@ onUnmounted(() => {
           <div><span class="eyebrow">concurrency</span><h2>并行解析</h2><p>同时解析的任务数与新任务超时。串行（1）逐个处理；并行（&gt;1）可同时处理多个链接</p></div>
         </div>
       </div>
+      <p v-if="settingsErr" class="error-block" role="alert">{{ settingsErr }} <button type="button" class="btn btn-line btn-sm" :disabled="settingsLoading" @click="loadSettings"><RefreshCw />重试</button></p>
       <form class="form" @submit.prevent="saveSettings">
         <label class="field"><span class="field-label">并发解析数（1 为串行）</span><input v-model.number="concInput" class="input input-mono" type="number" min="1" max="32" step="1" inputmode="numeric" /></label>
         <label class="field"><span class="field-label">任务超时（分钟）</span><input v-model.number="timeoutInput" class="input input-mono" type="number" min="1" max="720" step="1" inputmode="numeric" /></label>
-        <PrimaryButton type="submit" :loading="concSaving"><template #icon><Save /></template>保存设置</PrimaryButton>
+        <PrimaryButton type="submit" :loading="concSaving || settingsLoading" :disabled="!settings || !!settingsErr"><template #icon><Save /></template>保存设置</PrimaryButton>
       </form>
       <p class="state">
         当前 <b class="mono">并发 {{ settings?.concurrency ?? '-' }}</b> ·
@@ -213,7 +146,7 @@ onUnmounted(() => {
           <span class="sec-glyph ok"><DatabaseBackup /></span>
           <div><span class="eyebrow">storage</span><h2>数据库备份</h2><p>查看自动备份状态，或立即创建一份经过完整性校验的 SQLite 快照</p></div>
         </div>
-        <PrimaryButton size="sm" variant="soft" :loading="backupRunning || storage?.running" @click="runBackup">
+        <PrimaryButton size="sm" variant="soft" :loading="backupRunning || storage?.running" :disabled="storageLoading || !storage || !!storageErr" @click="runBackup">
           <template #icon><DatabaseBackup /></template>立即备份
         </PrimaryButton>
       </div>
@@ -226,64 +159,7 @@ onUnmounted(() => {
         <div class="storage-row"><span>下次执行</span><b>{{ storage?.next_run_at ? formatRelative(storage.next_run_at) : '-' }}</b></div>
       </div>
 
-      <div v-if="storage?.migration?.backup_id" class="migration-block">
-        <div class="migration-copy">
-          <ShieldAlert />
-          <div>
-            <strong>旧版迁移备份待确认</strong>
-            <p>确认新数据库可正常使用后，才可删除这份可能含明文凭据的升级备份。</p>
-            <code class="mono">{{ storage.migration.backup_path || storage.migration.backup_id }}</code>
-          </div>
-        </div>
-        <div class="migration-actions">
-          <label class="check danger"><input v-model="migrationDeleteConfirmed" type="checkbox" />我已验证迁移结果与当前数据库</label>
-          <PrimaryButton size="sm" variant="danger" :disabled="!migrationDeleteConfirmed" :loading="migrationDeleting" @click="deleteMigrationBackup">
-            <template #icon><Trash2 /></template>删除迁移备份
-          </PrimaryButton>
-        </div>
-      </div>
-      <p v-else-if="storage" class="fixed-note storage-ok"><ShieldCheck /><span>当前没有待确认的旧版迁移备份。</span></p>
-      <Transition name="v-fade"><p v-if="storageErr" class="error-block">{{ storageErr }}</p></Transition>
-    </GlassCard>
-
-    <OAuthProvidersSettings />
-
-    <GlassCard seam>
-      <div class="sec-head mb">
-        <div class="sec-title">
-          <span class="sec-glyph ok"><Mail /></span>
-          <div><span class="eyebrow">email auth</span><h2>邮箱登录</h2><p>分别控制已有用户登录和新用户注册入口</p></div>
-        </div>
-      </div>
-      <form class="auth-form" @submit.prevent="saveAuthSettings">
-        <div class="check-grid">
-          <label class="check"><input v-model="authForm.email_login_enabled" type="checkbox" :disabled="!authSettings || authSaving" />邮箱登录</label>
-          <label class="check"><input v-model="authForm.email_registration_enabled" type="checkbox" :disabled="!authSettings || authSaving" />邮箱注册</label>
-        </div>
-        <PrimaryButton type="submit" :loading="authSaving" :disabled="!authSettings"><template #icon><Save /></template>保存邮箱设置</PrimaryButton>
-      </form>
-      <p class="state">
-        邮箱登录 <b class="mono">{{ authSettings?.email_login_enabled ? '开启' : '关闭' }}</b> ·
-        邮箱注册 <b class="mono">{{ authSettings?.email_registration_enabled ? '开启' : '关闭' }}</b>
-      </p>
-      <Transition name="v-fade"><p v-if="authErr" class="error-block">{{ authErr }}</p></Transition>
-    </GlassCard>
-
-    <GlassCard seam>
-      <div class="sec-head mb">
-        <div class="sec-title">
-          <span class="sec-glyph live"><Lock /></span>
-          <div><span class="eyebrow">access</span><h2>修改访问密码</h2><p>更改登录此工具的访问密码，修改后其它设备需重新登录</p></div>
-        </div>
-      </div>
-      <form v-if="!passwordFixed" class="form pw" @submit.prevent="changePassword">
-        <label class="field"><span class="field-label">当前密码</span><input v-model="pw.current" class="input" type="password" autocomplete="current-password" /></label>
-        <label class="field"><span class="field-label">新密码（至少 6 位）</span><input v-model="pw.new" class="input" type="password" autocomplete="new-password" /></label>
-        <label class="field"><span class="field-label">确认新密码</span><input v-model="pw.confirm" class="input" type="password" autocomplete="new-password" /></label>
-        <PrimaryButton type="submit" :loading="pwSaving"><template #icon><KeyRound /></template>修改密码</PrimaryButton>
-      </form>
-      <p v-else class="fixed-note"><KeyRound /><span>访问密码由 <code class="mono">ACCESS_PASSWORD</code> 环境变量固定，无法在此修改。如需更改，请修改环境变量后重启服务。</span></p>
-      <Transition name="v-fade"><p v-if="pwErr" class="error-block">{{ pwErr }}</p></Transition>
+      <Transition name="v-fade"><p v-if="storageErr" class="error-block" role="alert">{{ storageErr }} <button type="button" class="btn btn-line btn-sm" :disabled="storageLoading" @click="loadStorage"><RefreshCw />重试</button></p></Transition>
     </GlassCard>
   </div>
 </template>
@@ -293,12 +169,7 @@ onUnmounted(() => {
 .sec-head.mb { margin-bottom: 14px; }
 .eyebrow { display: block; margin-bottom: 2px; }
 .form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; align-items: end; }
-.form.pw { grid-template-columns: 1fr 1fr 1fr auto; }
 .form .btn { height: 34px; }
-.auth-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; }
-.auth-form .btn { height: 34px; }
-.check-grid { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; padding: 3px 0; }
-.check.danger { color: var(--danger-ink); }
 .state { font-size: var(--fs-sm); color: var(--ink-2); margin-top: 12px; }
 .state b { color: var(--ink); font-weight: var(--fw-semi); }
 .storage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); }
@@ -309,22 +180,8 @@ onUnmounted(() => {
 .storage-row b { min-width: 0; color: var(--ink); font-weight: var(--fw-semi); text-align: right; overflow-wrap: anywhere; }
 .storage-row .path-value { font-size: var(--fs-xs); }
 .storage-row .danger-text { color: var(--danger-ink); }
-.migration-block { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 18px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--danger-line); }
-.migration-copy { min-width: 0; display: flex; align-items: flex-start; gap: 10px; color: var(--danger-ink); }
-.migration-copy > svg { width: 18px; height: 18px; flex: none; margin-top: 1px; }
-.migration-copy strong { display: block; font-size: var(--fs-sm); }
-.migration-copy p { margin: 3px 0 6px; color: var(--ink-2); font-size: var(--fs-xs); line-height: 1.5; }
-.migration-copy code { display: block; max-width: 100%; color: var(--ink-3); font-size: var(--fs-2xs); overflow-wrap: anywhere; }
-.migration-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 9px; }
-.migration-actions .check { font-size: var(--fs-xs); }
-.storage-ok { margin-top: 14px; }
-.fixed-note { display: flex; align-items: flex-start; gap: 8px; font-size: var(--fs-sm); color: var(--ink-2); padding: 11px 13px; border-radius: var(--r-md); background: var(--live-soft); border: 1px solid var(--live-line); line-height: 1.55; }
-.fixed-note svg { width: 15px; height: 15px; flex: none; margin-top: 2px; color: var(--live-ink); }
-.fixed-note code { font-size: var(--fs-xs); }
 @media (max-width: 820px) {
-  .form, .form.pw, .storage-grid { grid-template-columns: 1fr; }
+  .form, .storage-grid { grid-template-columns: 1fr; }
   .storage-row:nth-child(odd), .storage-row:nth-child(even) { padding-left: 0; padding-right: 0; border-left: 0; }
-  .migration-block { grid-template-columns: 1fr; }
-  .migration-actions { align-items: stretch; }
 }
 </style>

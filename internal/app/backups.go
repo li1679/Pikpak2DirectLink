@@ -501,14 +501,8 @@ func checkApplicationDatabaseBackup(ctx context.Context, path string) error {
 		return err
 	}
 	defer db.Close()
-	var name string
-	if err := db.QueryRowContext(ctx,
-		`SELECT name FROM schema_migrations WHERE version=?`, storageSchemaVersion,
-	).Scan(&name); err != nil {
-		return fmt.Errorf("database is not a Pikpak2DirectLink application backup: %w", err)
-	}
-	if name != storageSchemaMigrationName {
-		return fmt.Errorf("database has unknown storage schema %q", name)
+	if err := validatePersonalSchema(db); err != nil {
+		return fmt.Errorf("database is not a personal application backup: %w", err)
 	}
 	return nil
 }
@@ -554,4 +548,30 @@ func hashBackupFile(path string) (string, int64, error) {
 		return "", 0, err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
+}
+
+// copyFileWithSHA256 preserves the verified-backup integrity contract while staging.
+func copyFileWithSHA256(source, target string) (int64, string, error) {
+	input, err := os.Open(source)
+	if err != nil {
+		return 0, "", err
+	}
+	defer input.Close()
+	if err := durableMkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return 0, "", err
+	}
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, "", err
+	}
+	hash := sha256.New()
+	size, copyErr := io.Copy(io.MultiWriter(output, hash), input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return 0, "", copyErr
+	}
+	if closeErr != nil {
+		return 0, "", closeErr
+	}
+	return size, hex.EncodeToString(hash.Sum(nil)), nil
 }

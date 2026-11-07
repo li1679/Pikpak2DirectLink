@@ -37,36 +37,15 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			userID := "usr_atomic"
-			if _, err := db.Exec(
-				`INSERT INTO users(id, email, display_name, avatar_url, disabled, created_at, updated_at)
-				 VALUES(?,?,?,?,?,?,?)`,
-				userID, "atomic@example.com", "Atomic User", "", 0, now.Unix(), now.Unix(),
-			); err != nil {
-				t.Fatal(err)
-			}
-			subscriptionID := "sub_atomic"
-			if _, err := db.Exec(
-				`INSERT INTO user_subscriptions
-				 (id, user_id, source_cdk_code, remaining_bytes, used_bytes, expires_at, created_at, allow_proxy)
-				 VALUES(?,?,?,?,?,?,?,?)`,
-				subscriptionID, userID, nil, 500, 0, now.Add(24*time.Hour).Unix(), now.Unix(), 1,
-			); err != nil {
-				t.Fatal(err)
-			}
-			users := newUserStore(db)
 			durable := newSQLJobStore(db, cipher)
 			jobs := newJobStore(20, durable)
 			job := &Job{
 				ID: "atomic-job", Kind: ResourceMagnet, Mode: "proxy", Status: JobRunning,
-				Stage: StageTransfer, UserID: userID, ProxyAllowed: true, AccountID: account.ID,
+				Stage: StageTransfer, AccountID: account.ID,
 				TempAccountID: account.ID, TempIDs: []string{"temporary-file-id"},
 				CreatedAt: now, UpdatedAt: now,
 			}
 			if err := jobs.create(job); err != nil {
-				t.Fatal(err)
-			}
-			if err := users.reserveQuota(job.ID, userID, 100, true, now); err != nil {
 				t.Fatal(err)
 			}
 			cleanups := newProxyTempCleanupStore(db, cipher)
@@ -80,24 +59,17 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			}
 			server := &Server{
 				db: db, jobs: jobs, durableJobs: durable, accounts: accounts,
-				accountStore: accountStore, users: users, tempCleanups: cleanups,
+				accountStore: accountStore, tempCleanups: cleanups,
 				nowFunc: func() time.Time { return now },
 			}
 			result := &JobResult{File: DownloadItem{ID: "temporary-file-id", Size: "100"}}
 			err = server.finalizeCompletedJob(job.ID, AccountRuntime{ID: account.ID}, result, nil, 100, result.File.ID)
 
-			var remaining, used int64
-			if err := db.QueryRow(
-				`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
-				subscriptionID,
-			).Scan(&remaining, &used); err != nil {
-				t.Fatal(err)
-			}
 			storedAccounts, listErr := accountStore.List()
 			if listErr != nil {
 				t.Fatal(listErr)
 			}
-			storedJob, ok, getErr := durable.getAny(job.ID, now)
+			storedJob, ok, getErr := durable.get(job.ID, now)
 			if getErr != nil || !ok {
 				t.Fatalf("get durable job: ok=%v err=%v", ok, getErr)
 			}
@@ -110,21 +82,16 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 				if err == nil {
 					t.Fatal("finalization succeeded despite cleanup trigger")
 				}
-				if remaining != 400 || used != 0 || storedAccounts[0].TrafficUsed != 0 ||
-					storedJob.Status != JobRunning || cleanupCount != 1 {
-					t.Fatalf("partial commit: remaining=%d used=%d traffic=%d job=%s cleanups=%d",
-						remaining, used, storedAccounts[0].TrafficUsed, storedJob.Status, cleanupCount)
+				if storedAccounts[0].TrafficUsed != 0 || storedJob.Status != JobRunning || cleanupCount != 1 || accounts.accounts[account.ID].record.TrafficUsed != 0 {
+					t.Fatalf("partial commit: traffic=%d job=%s cleanups=%d", storedAccounts[0].TrafficUsed, storedJob.Status, cleanupCount)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("finalizeCompletedJob: %v", err)
 			}
-			if remaining != 400 || used != 100 || storedAccounts[0].TrafficUsed != 100 ||
-				storedJob.Status != JobCompleted || storedJob.ChargedBytes != 100 || cleanupCount != 1 {
-				t.Fatalf("incomplete commit: remaining=%d used=%d traffic=%d job=%s charged=%d cleanups=%d",
-					remaining, used, storedAccounts[0].TrafficUsed, storedJob.Status,
-					storedJob.ChargedBytes, cleanupCount)
+			if storedAccounts[0].TrafficUsed != 100 || storedJob.Status != JobCompleted || storedJob.ChargedBytes != 100 || cleanupCount != 1 || accounts.accounts[account.ID].record.TrafficUsed != 100 {
+				t.Fatalf("incomplete commit: traffic=%d job=%s charged=%d cleanups=%d", storedAccounts[0].TrafficUsed, storedJob.Status, storedJob.ChargedBytes, cleanupCount)
 			}
 			var encryptedIDs string
 			if err := db.QueryRow("SELECT file_ids_json FROM proxy_temp_cleanups").Scan(&encryptedIDs); err != nil {
@@ -138,18 +105,12 @@ func TestFinalizeCompletedJobCommitsAllLedgersAtomically(t *testing.T) {
 			if !errors.Is(secondErr, errJobAlreadyCompleted) {
 				t.Fatalf("second finalization error = %v, want errJobAlreadyCompleted", secondErr)
 			}
-			if err := db.QueryRow(
-				`SELECT remaining_bytes, used_bytes FROM user_subscriptions WHERE id=?`,
-				subscriptionID,
-			).Scan(&remaining, &used); err != nil {
-				t.Fatal(err)
-			}
 			storedAccounts, err = accountStore.List()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if remaining != 400 || used != 100 || storedAccounts[0].TrafficUsed != 100 {
-				t.Fatalf("duplicate charge: remaining=%d used=%d traffic=%d", remaining, used, storedAccounts[0].TrafficUsed)
+			if storedAccounts[0].TrafficUsed != 100 {
+				t.Fatalf("duplicate account traffic charge: %d", storedAccounts[0].TrafficUsed)
 			}
 		})
 	}
@@ -189,7 +150,7 @@ func TestRecordTempResourcePersistsCleanupIntentAtomically(t *testing.T) {
 			}
 			err = server.recordTempResource("temp-intent-job", "account", "temporary-file-id")
 
-			storedJob, ok, getErr := durable.getAny("temp-intent-job", now)
+			storedJob, ok, getErr := durable.get("temp-intent-job", now)
 			if getErr != nil || !ok {
 				t.Fatalf("get durable job: ok=%v err=%v", ok, getErr)
 			}
@@ -255,7 +216,7 @@ func TestCleanupFailureDetachesActiveAccountButKeepsLedger(t *testing.T) {
 	if cleanupErr == nil || errors.As(cleanupErr, &persistenceErr) {
 		t.Fatalf("cleanup error = %v, want remote-only failure", cleanupErr)
 	}
-	storedJob, ok, err := durable.getAny("retry-job", now)
+	storedJob, ok, err := durable.get("retry-job", now)
 	if err != nil || !ok {
 		t.Fatalf("get durable job: ok=%v err=%v", ok, err)
 	}
@@ -296,6 +257,7 @@ func TestResolveExistingStorageFailureKeepsAccountAvailable(t *testing.T) {
 	}
 	accounts := fakeAccountPool(account.ID, client)
 	accounts.store = accountStore
+	accounts.recordReplacer = accountStore
 	accounts.accounts[account.ID].record = account
 	durable := newSQLJobStore(db, cipher)
 	jobs := newJobStore(20, durable)
@@ -323,7 +285,7 @@ func TestResolveExistingStorageFailureKeepsAccountAvailable(t *testing.T) {
 	if storedAccounts[0].Status != AccountAvailable || storedAccounts[0].TrafficUsed != 0 {
 		t.Fatalf("storage failure changed account health: status=%s traffic=%d", storedAccounts[0].Status, storedAccounts[0].TrafficUsed)
 	}
-	storedJob, ok, err := durable.getAny("storage-failure-job", now)
+	storedJob, ok, err := durable.get("storage-failure-job", now)
 	if err != nil || !ok {
 		t.Fatalf("get durable job: ok=%v err=%v", ok, err)
 	}
@@ -354,6 +316,7 @@ func TestUncertainFinalizationDoesNotOverwriteCommittedDatabaseState(t *testing.
 	}
 	accounts := fakeAccountPool(account.ID, &fakePikPakClient{})
 	accounts.store = accountStore
+	accounts.recordReplacer = accountStore
 	accounts.accounts[account.ID].record = account
 
 	durable := newSQLJobStore(db, cipher)
@@ -399,7 +362,7 @@ func TestUncertainFinalizationDoesNotOverwriteCommittedDatabaseState(t *testing.
 	if storedAccounts[0].TrafficUsed != 100 {
 		t.Fatalf("committed account traffic was overwritten: %d", storedAccounts[0].TrafficUsed)
 	}
-	storedJob, ok, err := durable.getAny(running.ID, now)
+	storedJob, ok, err := durable.get(running.ID, now)
 	if err != nil || !ok {
 		t.Fatalf("get durable job: ok=%v err=%v", ok, err)
 	}

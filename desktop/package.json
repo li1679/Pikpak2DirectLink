@@ -1,0 +1,11 @@
+{
+  "name": "pikpak-personal-desktop",
+  "private": true,
+  "version": "1.0.1",
+  "scripts": {
+    "tauri": "tauri",
+    "build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./build.ps1",
+    "build:exe": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./build.ps1 -NoBundle"
+  },
+  "devDependencies": { "@tauri-apps/cli": "^2.0.0" }
+}

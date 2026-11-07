@@ -128,72 +128,37 @@ func TestOpenDatabaseKeepsMemoryDatabaseOnOneConnection(t *testing.T) {
 	}
 }
 
-func TestStorageSchemaMigrationIsCompleteAndIdempotent(t *testing.T) {
+func TestPersonalSchemaIsCompleteAndReopensWithoutChangingData(t *testing.T) {
 	db, err := openDatabase(":memory:")
 	if err != nil {
-		t.Fatalf("openDatabase: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-
-	wantTables := []string{
-		"schema_migrations",
-		"pikpak_accounts",
-		"pikpak_account_sessions",
-		"admin_credentials",
-		"admin_sessions",
-		"app_secrets",
-		"resolve_jobs",
-		"storage_migration_state",
-		"backup_runs",
-	}
-	for _, table := range wantTables {
-		has, err := tableExists(db, table)
-		if err != nil {
-			t.Fatalf("check table %s: %v", table, err)
-		}
-		if !has {
-			t.Errorf("missing table %s", table)
+	for _, table := range []string{"settings", "pikpak_accounts", "pikpak_account_sessions", "app_secrets", "resolve_jobs", "proxy_temp_cleanups", "backup_runs", "library_entries", "library_links"} {
+		if has, err := tableExists(db, table); err != nil || !has {
+			t.Errorf("required table %s exists=%v err=%v", table, has, err)
 		}
 	}
-	if has, err := columnExists(db, "user_sessions", "token_hash"); err != nil || !has {
-		t.Fatalf("fresh user_sessions token_hash exists = %v, err = %v; want true, nil", has, err)
+	for _, table := range []string{"users", "cdks", "user_sessions", "user_subscriptions", "user_quota_reservations", "admin_credentials", "admin_sessions", "schema_migrations", "storage_migration_state"} {
+		if has, err := tableExists(db, table); err != nil || has {
+			t.Errorf("removed table %s exists=%v err=%v", table, has, err)
+		}
 	}
-	if has, err := columnExists(db, "user_sessions", "token"); err != nil || has {
-		t.Fatalf("fresh user_sessions legacy token exists = %v, err = %v; want false, nil", has, err)
+	for _, field := range []struct{ table, column string }{{"pikpak_accounts", "session_file"}, {"resolve_jobs", "owner_type"}, {"resolve_jobs", "owner_id"}} {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, field.table, field.column).Scan(&count); err != nil || count != 0 {
+			t.Errorf("removed column %s.%s count=%d err=%v", field.table, field.column, count, err)
+		}
 	}
-
-	var migrationName string
-	if err := db.QueryRow(
-		`SELECT name FROM schema_migrations WHERE version = ?`, storageSchemaVersion,
-	).Scan(&migrationName); err != nil {
-		t.Fatalf("read storage migration: %v", err)
+	if _, err := db.Exec(`INSERT INTO app_secrets(key,ciphertext,updated_at) VALUES('test','v1.payload',1)`); err != nil {
+		t.Fatal(err)
 	}
-	if migrationName != storageSchemaMigrationName {
-		t.Fatalf("migration name = %q, want %q", migrationName, storageSchemaMigrationName)
-	}
-
-	if _, err := db.Exec(`INSERT INTO app_secrets(key, ciphertext, updated_at) VALUES('test', 'v1.payload', 1)`); err != nil {
-		t.Fatalf("seed app secret: %v", err)
-	}
-	if err := migrate(db); err != nil {
-		t.Fatalf("second migrate: %v", err)
+	if err := initializeDatabase(db); err != nil {
+		t.Fatal(err)
 	}
 	var ciphertext string
-	if err := db.QueryRow(`SELECT ciphertext FROM app_secrets WHERE key = 'test'`).Scan(&ciphertext); err != nil {
-		t.Fatalf("read app secret after second migration: %v", err)
-	}
-	if ciphertext != "v1.payload" {
-		t.Fatalf("second migration changed app secret to %q", ciphertext)
-	}
-
-	var count int
-	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, storageSchemaVersion,
-	).Scan(&count); err != nil {
-		t.Fatalf("count storage migration records: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf("storage migration record count = %d, want 1", count)
+	if err := db.QueryRow(`SELECT ciphertext FROM app_secrets WHERE key='test'`).Scan(&ciphertext); err != nil || ciphertext != "v1.payload" {
+		t.Fatalf("reinitialization changed data: ciphertext=%q err=%v", ciphertext, err)
 	}
 }
 

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -250,7 +251,7 @@ func (s *libraryStore) create(entry *LibraryEntry) error {
 	if !validLibraryName(entry.Name) {
 		return libraryValidationError("名称不能为空或超过 255 个字符")
 	}
-	id, err := generateSessionID()
+	id, err := newDownloadToken()
 	if err != nil {
 		return err
 	}
@@ -344,7 +345,7 @@ func (s *libraryStore) complete(id string, files []LibraryFile) error {
 	ids := map[string]bool{}
 	for i := range files {
 		if files[i].ID == "" {
-			files[i].ID, err = generateSessionID()
+			files[i].ID, err = newDownloadToken()
 			if err != nil {
 				return err
 			}
@@ -489,7 +490,7 @@ func (s *libraryStore) link(id, fileID, mode string, reset bool) (string, error)
 		return "", err
 	}
 	if token == "" {
-		token, err = generateSessionID()
+		token, err = newDownloadToken()
 		if err != nil {
 			return "", err
 		}
@@ -499,7 +500,7 @@ func (s *libraryStore) link(id, fileID, mode string, reset bool) (string, error)
 		return "", err
 	}
 	_, err = tx.Exec(`INSERT INTO library_links(token_hash,entry_id,file_id,mode,token_encrypted) VALUES(?,?,?,?,?)
-	 ON CONFLICT(entry_id,file_id) DO UPDATE SET token_hash=excluded.token_hash,mode=excluded.mode,token_encrypted=excluded.token_encrypted`, sessionTokenDigest(token), id, fileID, mode, encrypted)
+	 ON CONFLICT(entry_id,file_id) DO UPDATE SET token_hash=excluded.token_hash,mode=excluded.mode,token_encrypted=excluded.token_encrypted`, downloadTokenDigest(token), id, fileID, mode, encrypted)
 	if err != nil {
 		return "", err
 	}
@@ -519,7 +520,7 @@ func (s *libraryStore) lookupToken(token string) (*LibraryEntry, *LibraryFile, s
 		return nil, nil, "", errLibraryNotFound
 	}
 	var entryID, fileID, mode string
-	err := s.db.QueryRow(`SELECT entry_id,file_id,mode FROM library_links WHERE token_hash=?`, sessionTokenDigest(token)).Scan(&entryID, &fileID, &mode)
+	err := s.db.QueryRow(`SELECT entry_id,file_id,mode FROM library_links WHERE token_hash=?`, downloadTokenDigest(token)).Scan(&entryID, &fileID, &mode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, "", errLibraryNotFound
 	}
@@ -537,7 +538,7 @@ func (s *libraryStore) lookupToken(token string) (*LibraryEntry, *LibraryFile, s
 		file := &entry.Files[i]
 		// Re-read capability state through get: a concurrent revoke or reset
 		// between lookup and payload read must not authorize the old token.
-		if file.ID == fileID && constantTimeTokenEqual(file.Token, token) {
+		if file.ID == fileID && subtle.ConstantTimeCompare([]byte(file.Token), []byte(token)) == 1 {
 			return entry, file, file.Mode, nil
 		}
 	}

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { UserPlus, Users, Inbox } from 'lucide-vue-next'
+import { UserPlus, Users, Inbox, RefreshCw } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import AccountCard from '../AccountCard.vue'
@@ -13,6 +13,7 @@ const emit = defineEmits<{ (e: 'changed'): void }>()
 
 const accounts = ref<AccountSummary[]>([])
 const loading = ref(true)
+const loadError = ref('')
 const busyId = ref('')
 
 const form = ref({ username: '', password: '', traffic_limit_gb: 700 })
@@ -21,11 +22,12 @@ const adding = ref(false)
 
 async function load() {
   loading.value = true
+  loadError.value = ''
   try {
     const { accounts: list } = await api.accounts.list()
     accounts.value = list
   } catch (e: any) {
-    toast(e?.message || '加载账号失败', 'error')
+    loadError.value = e?.message || '加载账号失败'
   } finally {
     loading.value = false
   }
@@ -99,6 +101,7 @@ defineExpose({ refresh: load })
     </GlassCard>
 
     <div class="acct-list">
+      <GlassCard v-if="loadError"><p class="error-block" role="alert">{{ loadError }}</p><PrimaryButton size="sm" variant="line" @click="load"><RefreshCw />重试</PrimaryButton></GlassCard>
       <template v-if="loading">
         <Skeleton v-for="i in 2" :key="i" height="168px" radius="var(--r-lg)" />
       </template>
@@ -115,7 +118,7 @@ defineExpose({ refresh: load })
           @delete-parse-error="(id, index) => action(id, 'delete-parse-error', index)"
         />
       </template>
-      <GlassCard v-else>
+      <GlassCard v-else-if="!loadError">
         <div class="empty"><Inbox /><p>还没有账号，添加一个开始解析。</p></div>
       </GlassCard>
     </div>

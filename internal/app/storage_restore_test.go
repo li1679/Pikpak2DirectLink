@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,17 +36,11 @@ func TestRestoreDatabaseRoundTripCreatesSafetyBackup(t *testing.T) {
 		t.Fatalf("restored paths = %#v", result.RestoredPaths)
 	}
 
-	safety, err := loadMigrationBackup(result.SafetyBackupPath)
-	if err != nil {
-		t.Fatalf("load safety backup: %v", err)
-	}
-	if err := verifyMigrationBackup(safety); err != nil {
-		t.Fatalf("verify safety backup: %v", err)
-	}
+	safety := readAndVerifySafetyBackup(t, result.SafetyBackupPath)
 	if len(safety.Files) != 1 || safety.Files[0].Kind != "pre_restore_database" {
 		t.Fatalf("safety backup files = %#v", safety.Files)
 	}
-	safetyDB := filepath.Join(safety.Path, filepath.FromSlash(safety.Files[0].RelativePath))
+	safetyDB := filepath.Join(result.SafetyBackupPath, filepath.FromSlash(safety.Files[0].RelativePath))
 	if got := readRestoreTestDatabase(t, safetyDB); got != "current" {
 		t.Fatalf("safety database value = %q, want current", got)
 	}
@@ -221,13 +216,7 @@ func TestCreateRestoreSafetyBackupCopiesDatabaseSidecars(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backup, err := loadMigrationBackup(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyMigrationBackup(backup); err != nil {
-		t.Fatal(err)
-	}
+	backup := readAndVerifySafetyBackup(t, path)
 	if len(backup.Files) != 3 {
 		t.Fatalf("safety file count = %d, want 3", len(backup.Files))
 	}
@@ -239,174 +228,6 @@ func TestCreateRestoreSafetyBackupCopiesDatabaseSidecars(t *testing.T) {
 		if got, want := string(data), fixtures[file.OriginalPath]; got != want {
 			t.Fatalf("safety copy for %s = %q, want %q", file.OriginalPath, got, want)
 		}
-	}
-}
-
-func TestRestoreMigrationRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	cfg := restoreTestConfig(dir)
-	writeRestoreTestDatabase(t, cfg.DBFile, "legacy database")
-	fixtures := map[string]string{
-		cfg.AuthFile:     "legacy auth",
-		cfg.AccountsFile: "legacy accounts",
-		cfg.SessionFile:  "legacy bootstrap session",
-		filepath.Join(cfg.AccountSessionDir, "a.json"): "legacy account session",
-	}
-	for path, content := range fixtures {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	backup, err := prepareLegacyMigrationBackup(cfg, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.Remove(cfg.DBFile); err != nil {
-		t.Fatal(err)
-	}
-	writeRestoreTestDatabase(t, cfg.DBFile, "current database")
-	for path := range fixtures {
-		if err := os.Remove(path); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(cfg.AuthFile, []byte("current auth"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := RestoreMigration(context.Background(), cfg, backup.Path)
-	if err != nil {
-		t.Fatalf("RestoreMigration: %v", err)
-	}
-	if got := readRestoreTestDatabase(t, cfg.DBFile); got != "legacy database" {
-		t.Fatalf("restored database = %q", got)
-	}
-	for path, want := range fixtures {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			t.Fatalf("read restored %s: %v", path, err)
-		}
-		if string(data) != want {
-			t.Fatalf("restored %s = %q, want %q", path, data, want)
-		}
-	}
-	if result.SafetyBackupPath == "" {
-		t.Fatal("migration restore did not retain current data safety backup")
-	}
-	safety, err := loadMigrationBackup(result.SafetyBackupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := verifyMigrationBackup(safety); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestRestoreMigrationWithoutLegacyDatabaseRemovesCurrentDatabase(t *testing.T) {
-	dir := t.TempDir()
-	cfg := restoreTestConfig(dir)
-	if err := os.WriteFile(cfg.AuthFile, []byte("legacy auth"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backup, err := prepareLegacyMigrationBackup(cfg, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(cfg.AuthFile); err != nil {
-		t.Fatal(err)
-	}
-	writeRestoreTestDatabase(t, cfg.DBFile, "current database")
-
-	if _, err := RestoreMigration(context.Background(), cfg, backup.Path); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(cfg.DBFile); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("current database still exists after restoring a database-free migration: %v", err)
-	}
-	data, err := os.ReadFile(cfg.AuthFile)
-	if err != nil || string(data) != "legacy auth" {
-		t.Fatalf("restored auth = %q, err = %v", data, err)
-	}
-}
-
-func TestRestoreMigrationRemovesFilesAbsentFromSnapshot(t *testing.T) {
-	dir := t.TempDir()
-	cfg := restoreTestConfig(dir)
-	if err := os.WriteFile(cfg.AuthFile, []byte("legacy auth"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backup, err := prepareLegacyMigrationBackup(cfg, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, path := range []string{cfg.AccountsFile, cfg.SessionFile, filepath.Join(cfg.AccountSessionDir, "new.json")} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte("post-snapshot secret"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeRestoreTestDatabase(t, cfg.DBFile, "post-snapshot database")
-
-	if _, err := RestoreMigration(context.Background(), cfg, backup.Path); err != nil {
-		t.Fatalf("RestoreMigration: %v", err)
-	}
-	for _, path := range []string{cfg.AccountsFile, cfg.SessionFile, filepath.Join(cfg.AccountSessionDir, "new.json"), cfg.DBFile} {
-		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("post-snapshot path still exists %s: %v", path, err)
-		}
-	}
-}
-
-func TestRestoreMigrationRejectsLinkedSessionTarget(t *testing.T) {
-	dir := t.TempDir()
-	cfg := restoreTestConfig(dir)
-	legacySession := filepath.Join(cfg.AccountSessionDir, "a.json")
-	if err := os.MkdirAll(cfg.AccountSessionDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacySession, []byte("legacy session"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backup, err := prepareLegacyMigrationBackup(cfg, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	outside := filepath.Join(dir, "outside")
-	link := filepath.Join(cfg.AccountSessionDir, "linked")
-	if err := os.MkdirAll(outside, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	createRestoreTestDirectoryLink(t, link, outside)
-	victim := filepath.Join(outside, "victim.json")
-	if err := os.WriteFile(victim, []byte("outside-current"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	for index := range backup.Files {
-		if backup.Files[index].Kind == "account_session" {
-			backup.Files[index].OriginalPath = filepath.Join(link, "victim.json")
-		}
-	}
-	data, err := json.MarshalIndent(backup, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(backup.Path, migrationManifestName), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := RestoreMigration(context.Background(), cfg, backup.Path); err == nil {
-		t.Fatalf("linked target restore error = %v", err)
-	}
-	if data, err := os.ReadFile(victim); err != nil || string(data) != "outside-current" {
-		t.Fatalf("outside victim changed to %q, err=%v", data, err)
 	}
 }
 
@@ -430,7 +251,7 @@ func TestStageRestoreRejectsSourceChangedAfterVerification(t *testing.T) {
 	}
 }
 
-func TestRestoreContainmentAllowsLinkedConfiguredRoot(t *testing.T) {
+func TestCanonicalRestorePathAllowsLinkedParentDirectory(t *testing.T) {
 	dir := t.TempDir()
 	physicalRoot := filepath.Join(dir, "physical")
 	configuredRoot := filepath.Join(dir, "configured")
@@ -438,9 +259,9 @@ func TestRestoreContainmentAllowsLinkedConfiguredRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	createRestoreTestDirectoryLink(t, configuredRoot, physicalRoot)
-	target := filepath.Join(configuredRoot, "session.json")
-	if err := validateRestoreContainment(configuredRoot, target); err != nil {
-		t.Fatalf("linked configured root was rejected: %v", err)
+	got, err := canonicalRestorePath(filepath.Join(configuredRoot, "personal.db"))
+	if err != nil || filepath.Base(got) != "personal.db" || !sameFile(filepath.Dir(got), physicalRoot) {
+		t.Fatalf("canonical restore path=%q err=%v", got, err)
 	}
 }
 
@@ -535,40 +356,6 @@ func TestInterruptedRestoreJournalRollsBackOrFinishesCommit(t *testing.T) {
 	}
 }
 
-func TestRestoreMigrationRejectsManifestTargetOutsideConfiguredLayout(t *testing.T) {
-	dir := t.TempDir()
-	cfg := restoreTestConfig(dir)
-	if err := os.WriteFile(cfg.AuthFile, []byte("legacy auth"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	backup, err := prepareLegacyMigrationBackup(cfg, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	backup.Files[0].OriginalPath = filepath.Join(dir, "outside", "auth.json")
-	data, err := json.MarshalIndent(backup, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(backup.Path, migrationManifestName), data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := RestoreMigration(context.Background(), cfg, backup.Path); err == nil || !strings.Contains(err.Error(), "configured path") {
-		t.Fatalf("unexpected manifest target error: %v", err)
-	}
-}
-
-func restoreTestConfig(dir string) Config {
-	return Config{
-		DBFile:            filepath.Join(dir, "pikpak.db"),
-		AuthFile:          filepath.Join(dir, "auth.json"),
-		AccountsFile:      filepath.Join(dir, "accounts.json"),
-		SessionFile:       filepath.Join(dir, "bootstrap-session.json"),
-		AccountSessionDir: filepath.Join(dir, "accounts"),
-	}
-}
-
 func createRestoreTestDirectoryLink(t *testing.T, link, target string) {
 	t.Helper()
 	var err error
@@ -626,4 +413,54 @@ func openRestoreTestDatabase(t *testing.T, path string) *sql.DB {
 		t.Fatal(err)
 	}
 	return db
+}
+
+func readAndVerifySafetyBackup(t *testing.T, path string) restoreSafetyBackup {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(path, restoreSafetyManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var backup restoreSafetyBackup
+	if err := json.Unmarshal(data, &backup); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range backup.Files {
+		digest, size, err := hashBackupFile(filepath.Join(path, filepath.FromSlash(file.RelativePath)))
+		if err != nil || digest != file.SHA256 || size != file.Size {
+			t.Fatalf("safety backup integrity failure for %s: size=%d digest=%s err=%v", file.RelativePath, size, digest, err)
+		}
+	}
+	return backup
+}
+
+func TestStorageRestoreJournalRejectsNonDatabaseTargets(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "personal.db")
+	const id = "0123456789abcdef01234567"
+	for _, kind := range []string{"admin_auth", "accounts", "account_session", "database"} {
+		t.Run(kind, func(t *testing.T) {
+			target := filepath.Join(filepath.Dir(databasePath), "outside.json")
+			journal := storageRestoreJournal{
+				Version: restoreJournalVersion, ID: id, Mode: restoreJournalModeDatabase, DatabasePath: databasePath,
+				Operations: []storageRestoreJournalOperation{{Kind: kind, Target: target, Rollback: filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".restore-old-"+id)}},
+			}
+			if err := validateRestoreJournal(journal, databasePath); err == nil {
+				t.Fatal("journal accepted a non-database target")
+			}
+		})
+	}
+}
+
+func TestCheckApplicationBackupRejectsMarkerWithoutSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fake-personal.db")
+	db := openRestoreTestDatabase(t, path)
+	if _, err := db.Exec(fmt.Sprintf(`PRAGMA application_id=%d; PRAGMA user_version=%d; CREATE TABLE marker(value TEXT)`, personalApplicationID, personalSchemaVersion)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkApplicationDatabaseBackup(context.Background(), path); err == nil {
+		t.Fatal("backup verifier accepted an incomplete personal database")
+	}
 }

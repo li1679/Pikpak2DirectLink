@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { Link2, Files, CheckCheck, Settings2, Send } from 'lucide-vue-next'
+import { Link2, Files, CheckCheck, Settings2, Send, RefreshCw } from 'lucide-vue-next'
 import GlassCard from '../GlassCard.vue'
 import PrimaryButton from '../PrimaryButton.vue'
 import ResolveForm from '../ResolveForm.vue'
@@ -14,7 +14,7 @@ import { aria2 } from '../../composables/useAria2'
 import { toast } from '../../composables/useToast'
 import type { JobResult } from '../../lib/types'
 
-const { job, phase, error, submitting, submit, selectItems } = useJob({
+const { job, phase, error, submitting, pollingError, submit, selectItems, retry } = useJob({
   create: (b) => api.jobs.create(b),
   get: (id) => api.jobs.get(id),
   select: (id, b) => api.jobs.select(id, b),
@@ -80,6 +80,7 @@ function choosePushKind(kind: 'direct' | 'proxy') {
       </div>
       <ResolveForm :loading="submitting" @submit="onSubmit" />
       <div class="dock-wrap"><JobStatus :job="job" :phase="phase" :error="error" :submitting="submitting" show-attempts /></div>
+      <PrimaryButton v-if="pollingError" size="sm" variant="line" :loading="submitting" @click="retry"><RefreshCw />重新查询任务</PrimaryButton>
     </GlassCard>
 
     <Transition name="v-rise">

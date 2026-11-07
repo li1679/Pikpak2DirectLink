@@ -1,52 +1,21 @@
-// Typed HTTP client for the Pikpak2DirectLink backend. Every method mirrors a
-// route registered in internal/app/server.go and cdk_handlers.go. Cookies
-// (admin `session` / CDK `cdk`) flow automatically with same-origin requests.
+// Typed HTTP client for the local PikPak tool.
 import type {
   AccountSummary,
-  AdminSubscription,
-  AdminSubscriptionRevisionRequest,
-  AdminUserDetail,
-  AdminUsersResponse,
-  AuthSettingsResponse,
-  AuthResult,
-  AuthStatus,
-  BatchSummary,
-  CDKView,
+  ApiError,
+  BackupRun,
   ConfigResponse,
-  CreateAdminSubscriptionRequest,
-  CreateCDKRequest,
   CreateJobRequest,
-  Job,
-  LogEntry,
-  LibraryEntry,
-  LibraryDownloadLink,
-  OAuthProvider,
-  OAuthProviderRequest,
   CreateLibraryEntryRequest,
-  ResolveHistoryDetail,
-  ResolveHistorySummary,
+  Job,
+  LibraryDownloadLink,
+  LibraryEntry,
+  LogEntry,
+  OperationResult,
   SelectItemsRequest,
   SettingsResponse,
   StorageStatusResponse,
-  BackupRun,
-  UpdateCDKRequest,
-  UpdateAdminSubscriptionRequest,
-  UpdateAuthSettingsRequest,
   UpdateSettingsRequest,
-  UpdateStatus,
-  UserAuthConfig,
-  UserJobView,
-  UserStatusResponse,
 } from './types'
-import type { ApiError } from './types'
-
-let unauthorizedHandler: (() => void) | null = null
-
-/** Install a callback fired once when any request returns 401. Each app wires
- * its own redirect (admin → "/", registered user → "/u"). */
-export function setUnauthorizedHandler(fn: (() => void) | null) {
-  unauthorizedHandler = fn
-}
 
 function makeError(message: string, status?: number): ApiError {
   const err = new Error(message) as ApiError
@@ -54,89 +23,51 @@ function makeError(message: string, status?: number): ApiError {
   return err
 }
 
-async function request<T>(method: string, path: string, body?: unknown, extraHeaders?: Record<string, string>): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response
+  let text: string
   try {
     res = await fetch(path, {
       method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json', ...extraHeaders } : extraHeaders,
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      credentials: 'same-origin',
+      signal: method === 'GET' ? AbortSignal.timeout(15000) : undefined,
     })
+    text = await res.text()
   } catch (e) {
+    if (e instanceof Error && e.name === 'TimeoutError') throw makeError('请求超时，请重试')
     throw makeError(e instanceof Error ? e.message : '网络请求失败')
   }
+  if (res.status === 204) return undefined as T
 
-  if (res.status === 401 && unauthorizedHandler) {
-    unauthorizedHandler()
-  }
-
-  if (res.status === 204) {
-    return undefined as T
-  }
-
-  let payload: any = null
-  const text = await res.text()
+  let payload: unknown = null
   if (text) {
-    try {
-      payload = JSON.parse(text)
-    } catch {
-      // non-JSON body; keep payload null
-    }
+    try { payload = JSON.parse(text) }
+    catch { throw makeError(`服务器返回了无效响应 (${res.status})`, res.status) }
   }
-
   if (!res.ok) {
-    const message = (payload && payload.error) || `请求失败 (${res.status})`
-    throw makeError(message, res.status)
+    const error = payload && typeof payload === 'object' && 'error' in payload ? payload.error : null
+    throw makeError(typeof error === 'string' ? error : `请求失败 (${res.status})`, res.status)
   }
+  if (payload === null) throw makeError('服务器返回了空响应', res.status)
   return payload as T
 }
 
 export const api = {
-  auth: {
-    status: () => request<AuthStatus>('GET', '/api/auth/status'),
-    setup: (password: string, setupToken: string) =>
-      request<AuthResult>('POST', '/api/auth/setup', { password }, setupToken ? { 'X-Setup-Token': setupToken } : undefined),
-    login: (password: string) => request<AuthResult>('POST', '/api/auth/login', { password }),
-    logout: () => request<AuthResult>('POST', '/api/auth/logout'),
-    password: (current_password: string, new_password: string) =>
-      request<AuthResult>('POST', '/api/auth/password', { current_password, new_password }),
-  },
-
   config: () => request<ConfigResponse>('GET', '/api/config'),
 
   settings: {
     get: () => request<SettingsResponse>('GET', '/api/settings'),
     update: (body: UpdateSettingsRequest) => request<SettingsResponse>('PUT', '/api/settings', body),
-    auth: {
-      get: () => request<AuthSettingsResponse>('GET', '/api/settings/auth'),
-      update: (body: UpdateAuthSettingsRequest) => request<AuthSettingsResponse>('PUT', '/api/settings/auth', body),
-    },
-    oauthProviders: {
-      list: () => request<{ providers: OAuthProvider[] }>('GET', '/api/settings/oauth/providers'),
-      create: (body: OAuthProviderRequest) => request<OAuthProvider>('POST', '/api/settings/oauth/providers', body),
-      update: (id: string, body: OAuthProviderRequest) =>
-        request<OAuthProvider>('PUT', `/api/settings/oauth/providers/${encodeURIComponent(id)}`, body),
-      remove: (id: string, expected_revision: number) =>
-        request<void>('DELETE', `/api/settings/oauth/providers/${encodeURIComponent(id)}`, { expected_revision }),
-    },
     storage: {
       get: () => request<StorageStatusResponse>('GET', '/api/settings/storage'),
       backup: () => request<{ backup: BackupRun }>('POST', '/api/settings/storage/backups'),
-      deleteMigrationBackup: (backup_id: string) =>
-        request<void>('DELETE', '/api/settings/storage/migration-backup', { backup_id }),
     },
-  },
-
-  update: {
-    status: () => request<UpdateStatus>('GET', '/api/update'),
-    check: () => request<UpdateStatus>('POST', '/api/update/check'),
-    install: () => request<UpdateStatus>('POST', '/api/update/install'),
   },
 
   logs: {
     list: (after = 0) => request<{ logs: LogEntry[] }>('GET', `/api/logs?after=${after}`),
-    clear: () => request<AuthResult>('DELETE', '/api/logs'),
+    clear: () => request<OperationResult>('DELETE', '/api/logs'),
   },
 
   accounts: {
@@ -144,35 +75,12 @@ export const api = {
     add: (body: { username: string; password: string; traffic_limit_gb: number }) =>
       request<AccountSummary>('POST', '/api/accounts', body),
     update: (id: string, traffic_limit_gb: number) =>
-      request<AuthResult>('PATCH', `/api/accounts/${id}`, { traffic_limit_gb }),
-    remove: (id: string) => request<AuthResult>('DELETE', `/api/accounts/${id}`),
-    reset: (id: string) => request<AuthResult>('POST', `/api/accounts/${id}/reset`),
+      request<OperationResult>('PATCH', `/api/accounts/${id}`, { traffic_limit_gb }),
+    remove: (id: string) => request<OperationResult>('DELETE', `/api/accounts/${id}`),
+    reset: (id: string) => request<OperationResult>('POST', `/api/accounts/${id}/reset`),
     refreshLogin: (id: string) => request<AccountSummary>('POST', `/api/accounts/${id}/refresh-login`),
     deleteParseError: (id: string, index: number) =>
-      request<AuthResult>('DELETE', `/api/accounts/${id}/parse-errors/${index}`),
-  },
-
-  users: {
-    list: (q = '', limit = 50, offset = 0) => {
-      const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
-      if (q) params.set('q', q)
-      return request<AdminUsersResponse>('GET', `/api/users?${params.toString()}`)
-    },
-    get: (userID: string) => request<AdminUserDetail>('GET', `/api/users/${encodeURIComponent(userID)}`),
-    createSubscription: (userID: string, body: CreateAdminSubscriptionRequest) =>
-      request<AdminSubscription>('POST', `/api/users/${encodeURIComponent(userID)}/subscriptions`, body),
-    updateSubscription: (userID: string, subscriptionID: string, body: UpdateAdminSubscriptionRequest) =>
-      request<AdminSubscription>(
-        'PATCH',
-        `/api/users/${encodeURIComponent(userID)}/subscriptions/${encodeURIComponent(subscriptionID)}`,
-        body,
-      ),
-    terminateSubscription: (userID: string, subscriptionID: string, body: AdminSubscriptionRevisionRequest) =>
-      request<AdminSubscription>(
-        'POST',
-        `/api/users/${encodeURIComponent(userID)}/subscriptions/${encodeURIComponent(subscriptionID)}/terminate`,
-        body,
-      ),
+      request<OperationResult>('DELETE', `/api/accounts/${id}/parse-errors/${index}`),
   },
 
   jobs: {
@@ -193,36 +101,6 @@ export const api = {
     revokeLink: (id: string, fileID: string) =>
       request<void>('DELETE', `/api/library/${encodeURIComponent(id)}/files/${encodeURIComponent(fileID)}/link`),
   },
-
-  cdks: {
-    list: () => request<{ cdks: CDKView[] }>('GET', '/api/cdks'),
-    create: (body: CreateCDKRequest) => request<{ cdks: CDKView[] }>('POST', '/api/cdks', body),
-    update: (code: string, body: UpdateCDKRequest) =>
-      request<CDKView>('PATCH', `/api/cdks/${encodeURIComponent(code)}`, body),
-    remove: (code: string) => request<AuthResult>('DELETE', `/api/cdks/${encodeURIComponent(code)}`),
-  },
-
-  u: {
-    authConfig: () => request<UserAuthConfig>('GET', '/api/u/auth/config'),
-    emailLogin: (email: string, password: string) =>
-      request<UserStatusResponse>('POST', '/api/u/auth/email/login', { email, password }),
-    emailRegister: (email: string, password: string) =>
-      request<UserStatusResponse>('POST', '/api/u/auth/email/register', { email, password }),
-    status: () => request<UserStatusResponse>('GET', '/api/u/status'),
-    logout: () => request<AuthResult>('POST', '/api/u/logout'),
-    redeemCDK: (code: string) => request<UserStatusResponse>('POST', '/api/u/cdks/redeem', { code }),
-    jobs: {
-      create: (body: CreateJobRequest) => request<UserJobView>('POST', '/api/u/jobs', body),
-      get: (id: string) => request<UserJobView>('GET', `/api/u/jobs/${id}`),
-      select: (id: string, body: SelectItemsRequest) =>
-        request<UserJobView>('POST', `/api/u/jobs/${id}/select`, body),
-    },
-    history: {
-      list: () => request<{ history: ResolveHistorySummary[] }>('GET', '/api/u/history'),
-      get: (id: string) => request<ResolveHistoryDetail>('GET', `/api/u/history/${encodeURIComponent(id)}`),
-    },
-  },
 }
 
-export type Batch = BatchSummary
 export { type ApiError }

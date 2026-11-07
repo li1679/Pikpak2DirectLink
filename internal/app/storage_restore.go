@@ -13,7 +13,24 @@ import (
 	"time"
 )
 
-const restoreSafetyDirectory = "restore-safety"
+const (
+	restoreSafetyDirectory    = "restore-safety"
+	restoreSafetyManifestName = "manifest.json"
+)
+
+type restoreSafetyBackup struct {
+	ID        string              `json:"id"`
+	CreatedAt time.Time           `json:"created_at"`
+	Files     []restoreSafetyFile `json:"files"`
+}
+
+type restoreSafetyFile struct {
+	Kind         string `json:"kind"`
+	OriginalPath string `json:"original_path"`
+	RelativePath string `json:"relative_path"`
+	Size         int64  `json:"size"`
+	SHA256       string `json:"sha256"`
+}
 
 // StorageRestoreResult describes the files changed by an offline restore and
 // where the pre-restore safety copy was saved.
@@ -27,9 +44,7 @@ type restoreOperation struct {
 	source         string
 	target         string
 	staged         string
-	checkSQLite    bool
 	checkAppDB     bool
-	containedIn    string
 	expectedSize   int64
 	expectedSHA256 string
 	rollback       string
@@ -75,189 +90,6 @@ func RestoreDatabase(ctx context.Context, dbPath, backupPath string) (StorageRes
 		{kind: "database_shm", target: target + "-shm"},
 	}
 	return executeStorageRestore(ctx, Config{DBFile: target}, operations, restoreJournalModeDatabase)
-}
-
-// RestoreMigration restores the legacy files captured before the secure
-// SQLite migration. Manifest destinations must match the current configured
-// legacy layout so a modified manifest cannot overwrite arbitrary files.
-func RestoreMigration(ctx context.Context, cfg Config, backupPath string) (StorageRestoreResult, error) {
-	databasePath, err := absoluteDatabasePath(cfg.DBFile)
-	if err != nil {
-		return StorageRestoreResult{}, err
-	}
-	lock, err := acquireStorageFileLock(databasePath)
-	if err != nil {
-		return StorageRestoreResult{}, err
-	}
-	defer lock.Close()
-	if err := recoverInterruptedStorageRestore(cfg); err != nil {
-		return StorageRestoreResult{}, err
-	}
-	backupRoot, err := filepath.Abs(strings.TrimSpace(backupPath))
-	if err != nil || strings.TrimSpace(backupPath) == "" {
-		if err == nil {
-			err = errors.New("migration backup directory is empty")
-		}
-		return StorageRestoreResult{}, err
-	}
-	backup, err := loadMigrationBackup(backupRoot)
-	if err != nil {
-		return StorageRestoreResult{}, fmt.Errorf("load migration backup: %w", err)
-	}
-	if len(backup.Files) == 0 {
-		return StorageRestoreResult{}, errors.New("migration backup manifest contains no files")
-	}
-	if err := verifyMigrationBackup(backup); err != nil {
-		return StorageRestoreResult{}, fmt.Errorf("verify migration backup: %w", err)
-	}
-
-	operations, hasDatabase, err := migrationRestoreOperations(cfg, backupRoot, backup)
-	if err != nil {
-		return StorageRestoreResult{}, err
-	}
-	if !hasDatabase {
-		operations = append(operations, restoreOperation{kind: "database", target: databasePath})
-	}
-	operations = append(operations,
-		restoreOperation{kind: "database_wal", target: databasePath + "-wal"},
-		restoreOperation{kind: "database_shm", target: databasePath + "-shm"},
-	)
-	return executeStorageRestore(ctx, cfg, operations, restoreJournalModeMigration)
-}
-
-func migrationRestoreOperations(cfg Config, backupRoot string, backup *migrationBackup) ([]restoreOperation, bool, error) {
-	canonicalBackupRoot, err := canonicalRestorePath(backupRoot)
-	if err != nil {
-		return nil, false, err
-	}
-	exactTargets := map[string]string{
-		"database":          cfg.DBFile,
-		"admin_auth":        cfg.AuthFile,
-		"accounts":          cfg.AccountsFile,
-		"bootstrap_session": cfg.SessionFile,
-	}
-	for kind, configured := range exactTargets {
-		absolute, err := absoluteRestorePath(configured)
-		if err != nil {
-			return nil, false, fmt.Errorf("resolve configured %s path: %w", kind, err)
-		}
-		exactTargets[kind] = absolute
-	}
-	sessionRoot, err := absoluteRestorePath(cfg.AccountSessionDir)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolve configured account session directory: %w", err)
-	}
-
-	seenTargets := make(map[string]struct{}, len(backup.Files))
-	seenSessionTargets := make(map[string]struct{}, len(backup.Files))
-	seenExactKinds := make(map[string]struct{}, len(exactTargets))
-	operations := make([]restoreOperation, 0, len(backup.Files))
-	hasDatabase := false
-	for _, file := range backup.Files {
-		if !filepath.IsAbs(file.OriginalPath) {
-			return nil, false, fmt.Errorf("migration backup target for %s is not absolute", file.Kind)
-		}
-		target, err := filepath.Abs(file.OriginalPath)
-		if err != nil {
-			return nil, false, err
-		}
-		target = filepath.Clean(target)
-		switch file.Kind {
-		case "database", "admin_auth", "accounts", "bootstrap_session":
-			if !samePath(target, exactTargets[file.Kind]) {
-				return nil, false, fmt.Errorf("migration backup %s target %q does not match configured path %q", file.Kind, target, exactTargets[file.Kind])
-			}
-		case "account_session":
-			inside, err := pathInsideDirectory(sessionRoot, target)
-			if err != nil || !inside {
-				return nil, false, fmt.Errorf("migration account session target %q is outside configured directory %q", target, sessionRoot)
-			}
-		default:
-			return nil, false, fmt.Errorf("migration backup contains unsupported file kind %q", file.Kind)
-		}
-		canonicalTarget, err := canonicalRestorePath(target)
-		if err != nil {
-			return nil, false, err
-		}
-		insideBackup, err := pathInsideDirectory(canonicalBackupRoot, canonicalTarget)
-		if err != nil {
-			return nil, false, err
-		}
-		if insideBackup || samePath(canonicalBackupRoot, canonicalTarget) {
-			return nil, false, fmt.Errorf("migration restore target %q is inside the backup directory", target)
-		}
-		key := comparablePath(canonicalTarget)
-		if _, duplicate := seenTargets[key]; duplicate {
-			return nil, false, fmt.Errorf("migration backup contains duplicate target %q", target)
-		}
-		seenTargets[key] = struct{}{}
-		source := filepath.Join(backupRoot, filepath.FromSlash(file.RelativePath))
-		operations = append(operations, restoreOperation{
-			kind:           file.Kind,
-			source:         source,
-			target:         target,
-			checkSQLite:    file.Kind == "database",
-			expectedSize:   file.Size,
-			expectedSHA256: file.SHA256,
-		})
-		if file.Kind == "account_session" {
-			operations[len(operations)-1].containedIn = sessionRoot
-			canonical, err := canonicalRestorePath(target)
-			if err != nil {
-				return nil, false, err
-			}
-			seenSessionTargets[comparablePath(canonical)] = struct{}{}
-		} else {
-			seenExactKinds[file.Kind] = struct{}{}
-		}
-		if file.Kind == "database" {
-			hasDatabase = true
-		}
-	}
-	for _, kind := range []string{"admin_auth", "accounts", "bootstrap_session"} {
-		if _, exists := seenExactKinds[kind]; !exists {
-			operations = append(operations, restoreOperation{kind: kind, target: exactTargets[kind]})
-		}
-	}
-
-	resolvedSessionRoot, err := canonicalRestorePath(sessionRoot)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolve configured account session directory: %w", err)
-	}
-	err = filepath.WalkDir(resolvedSessionRoot, func(path string, entry os.DirEntry, walkErr error) error {
-		if errors.Is(walkErr, os.ErrNotExist) {
-			return nil
-		}
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == resolvedSessionRoot {
-			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("account session path %q is a symbolic link", path)
-		}
-		if entry.IsDir() {
-			return validateRestoreContainment(resolvedSessionRoot, path)
-		}
-		if !entry.Type().IsRegular() {
-			return fmt.Errorf("account session path %q is not a regular file", path)
-		}
-		canonical, err := canonicalRestorePath(path)
-		if err != nil {
-			return err
-		}
-		if _, exists := seenSessionTargets[comparablePath(canonical)]; !exists {
-			operations = append(operations, restoreOperation{
-				kind: "account_session", target: path, containedIn: resolvedSessionRoot,
-			})
-		}
-		return nil
-	})
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, false, err
-	}
-	return operations, hasDatabase, nil
 }
 
 func executeStorageRestore(ctx context.Context, cfg Config, operations []restoreOperation, mode string) (StorageRestoreResult, error) {
@@ -327,11 +159,6 @@ func validateRestoreOperations(operations []restoreOperation) error {
 		}
 		seen[key] = struct{}{}
 		targets = append(targets, operation.target)
-		if operation.containedIn != "" {
-			if err := validateRestoreContainment(operation.containedIn, operation.target); err != nil {
-				return err
-			}
-		}
 	}
 	for _, operation := range operations {
 		if operation.source == "" {
@@ -363,11 +190,6 @@ func stageRestoreOperations(ctx context.Context, operations []restoreOperation, 
 				return err
 			}
 		}
-		if operation.containedIn != "" {
-			if err := validateRestoreContainment(operation.containedIn, operation.target); err != nil {
-				return err
-			}
-		}
 		if err := durableMkdirAll(filepath.Dir(operation.target), 0o700); err != nil {
 			return fmt.Errorf("create restore target directory: %w", err)
 		}
@@ -389,10 +211,6 @@ func stageRestoreOperations(ctx context.Context, operations []restoreOperation, 
 		}
 		if operation.checkAppDB {
 			if err := checkApplicationDatabaseBackup(ctx, operation.staged); err != nil {
-				return fmt.Errorf("verify staged %s restore: %w", operation.kind, err)
-			}
-		} else if operation.checkSQLite {
-			if err := checkSQLiteBackup(ctx, operation.staged); err != nil {
 				return fmt.Errorf("verify staged %s restore: %w", operation.kind, err)
 			}
 		}
@@ -452,7 +270,7 @@ func createRestoreSafetyBackup(databasePath string, operations []restoreOperatio
 		}
 	}()
 
-	manifest := migrationBackup{ID: name, CreatedAt: now}
+	manifest := restoreSafetyBackup{ID: name, CreatedAt: now}
 	for index, target := range existing {
 		relative := filepath.Join("files", fmt.Sprintf("%04d-%s", index, filepath.Base(target.path)))
 		copiedPath := filepath.Join(tempPath, relative)
@@ -463,7 +281,7 @@ func createRestoreSafetyBackup(databasePath string, operations []restoreOperatio
 		if err := syncBackupFile(copiedPath); err != nil {
 			return "", err
 		}
-		manifest.Files = append(manifest.Files, migrationBackupFile{
+		manifest.Files = append(manifest.Files, restoreSafetyFile{
 			Kind:         "pre_restore_" + target.kind,
 			OriginalPath: target.path,
 			RelativePath: filepath.ToSlash(relative),
@@ -475,7 +293,7 @@ func createRestoreSafetyBackup(databasePath string, operations []restoreOperatio
 	if err != nil {
 		return "", err
 	}
-	manifestPath := filepath.Join(tempPath, migrationManifestName)
+	manifestPath := filepath.Join(tempPath, restoreSafetyManifestName)
 	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
 		return "", err
 	}
@@ -651,46 +469,6 @@ func absoluteRestorePath(path string) (string, error) {
 		return "", err
 	}
 	return filepath.Clean(absPath), nil
-}
-
-func pathInsideDirectory(root, path string) (bool, error) {
-	relative, err := filepath.Rel(root, path)
-	if err != nil {
-		return false, err
-	}
-	if relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return false, nil
-	}
-	return true, nil
-}
-
-func validateRestoreContainment(root, target string) error {
-	inside, err := pathInsideDirectory(root, target)
-	if err != nil {
-		return err
-	}
-	if !inside {
-		return fmt.Errorf("restore target %q is outside configured directory %q", target, root)
-	}
-	canonicalRoot, err := canonicalRestorePath(root)
-	if err != nil {
-		return err
-	}
-	canonicalTarget, err := canonicalRestorePath(target)
-	if err != nil {
-		return err
-	}
-	inside, err = pathInsideDirectory(canonicalRoot, canonicalTarget)
-	if err != nil {
-		return err
-	}
-	if !inside {
-		return fmt.Errorf("unsafe restore target %q resolves outside %q", target, root)
-	}
-	if err := rejectFinalRestoreSymlink(target); err != nil {
-		return err
-	}
-	return nil
 }
 
 func canonicalRestorePath(path string) (string, error) {

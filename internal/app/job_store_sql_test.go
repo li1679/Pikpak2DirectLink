@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestSQLJobStoreRoundTripAndOwnerQueries(t *testing.T) {
+func TestSQLJobStoreRoundTripAndMetadataQueries(t *testing.T) {
 	store, db, now := newTestSQLJobStore(t)
 	job := fullSQLJobFixture(now)
 
@@ -19,7 +19,7 @@ func TestSQLJobStoreRoundTripAndOwnerQueries(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 
-	created, ok, err := store.get(job.ID, resolveJobOwnerUser, job.UserID, now.Add(time.Minute))
+	created, ok, err := store.get(job.ID, now.Add(time.Minute))
 	if err != nil || !ok {
 		t.Fatalf("get created job = ok %v, err %v", ok, err)
 	}
@@ -39,7 +39,7 @@ func TestSQLJobStoreRoundTripAndOwnerQueries(t *testing.T) {
 		t.Fatalf("upsert: %v", err)
 	}
 
-	got, ok, err := store.get(job.ID, resolveJobOwnerUser, job.UserID, now.Add(time.Hour))
+	got, ok, err := store.get(job.ID, now.Add(time.Hour))
 	if err != nil || !ok {
 		t.Fatalf("get updated job = ok %v, err %v", ok, err)
 	}
@@ -50,34 +50,25 @@ func TestSQLJobStoreRoundTripAndOwnerQueries(t *testing.T) {
 		t.Fatalf("updated job mismatch\n got: %#v\nwant: %#v", got, wantUpdated)
 	}
 
-	jobs, err := store.listByUser(job.UserID, now.Add(time.Hour))
-	if err != nil {
-		t.Fatalf("list by user: %v", err)
+	records, err := store.listRecords(now.Add(time.Hour), false)
+	if err != nil || len(records) != 1 || !reflect.DeepEqual(records[0].Job, wantUpdated) {
+		t.Fatalf("list records = %#v, err=%v; want updated job", records, err)
 	}
-	if len(jobs) != 1 || !reflect.DeepEqual(jobs[0], wantUpdated) {
-		t.Fatalf("list by user = %#v; want updated job", jobs)
-	}
-
-	if _, ok, err := store.get(job.ID, resolveJobOwnerUser, "another-user", now.Add(time.Hour)); err != nil || ok {
-		t.Fatalf("wrong-owner get = ok %v, err %v; want false, nil", ok, err)
-	}
-	if _, ok, err := store.get(job.ID, resolveJobOwnerCDK, "some-cdk", now.Add(time.Hour)); err != nil || ok {
-		t.Fatalf("wrong owner type get = ok %v, err %v; want false, nil", ok, err)
+	if _, ok, err := store.get("missing-job", now.Add(time.Hour)); err != nil || ok {
+		t.Fatalf("missing job get = ok %v, err %v", ok, err)
 	}
 
 	var (
-		ownerType   string
-		ownerID     string
 		phase       string
 		resultCount int
 		charged     int64
 	)
-	if err := db.QueryRow(`SELECT owner_type, owner_id, phase, result_count, charged_bytes
-		FROM resolve_jobs WHERE id=?`, job.ID).Scan(&ownerType, &ownerID, &phase, &resultCount, &charged); err != nil {
+	if err := db.QueryRow(`SELECT phase, result_count, charged_bytes
+		FROM resolve_jobs WHERE id=?`, job.ID).Scan(&phase, &resultCount, &charged); err != nil {
 		t.Fatalf("read metadata: %v", err)
 	}
-	if ownerType != resolveJobOwnerUser || ownerID != job.UserID || phase != string(job.Stage) || resultCount != 3 || charged != 99 {
-		t.Fatalf("metadata = %q, %q, %q, %d, %d", ownerType, ownerID, phase, resultCount, charged)
+	if phase != string(job.Stage) || resultCount != 3 || charged != 99 {
+		t.Fatalf("metadata = %q, %d, %d", phase, resultCount, charged)
 	}
 }
 
@@ -87,7 +78,7 @@ func TestSQLJobStorePayloadIsEncrypted(t *testing.T) {
 		ID: "encrypted-job", Kind: ResourceShare, Mode: "proxy",
 		Input:         "https://mypikpak.com/s/secret-share?pwd=hidden-passcode",
 		OriginalInput: "raw-secret-input", PassCode: "hidden-passcode",
-		Status: JobCompleted, Stage: StageComplete, UserID: "user-1",
+		Status: JobCompleted, Stage: StageComplete,
 		Result: &JobResult{
 			DirectURL:  "https://origin.example/private-download-token",
 			ProxyURL:   "https://service.example/proxy/encrypted-job?token=secret-proxy-token",
@@ -120,7 +111,7 @@ func TestSQLJobStoreAssignsStableChildIndexes(t *testing.T) {
 	store, db, now := newTestSQLJobStore(t)
 	parent := &Job{
 		ID: "parent", Kind: ResourceBatch, Mode: "direct", Status: JobRunning,
-		Stage: StageTransfer, UserID: "user-1", CreatedAt: now, UpdatedAt: now,
+		Stage: StageTransfer, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := store.create(parent); err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -128,7 +119,7 @@ func TestSQLJobStoreAssignsStableChildIndexes(t *testing.T) {
 	for _, id := range []string{"child-a", "child-b"} {
 		child := &Job{
 			ID: id, ParentID: parent.ID, Kind: ResourceMagnet, Mode: "direct",
-			Status: JobQueued, Stage: StageTransfer, UserID: parent.UserID,
+			Status: JobQueued, Stage: StageTransfer,
 			CreatedAt: now, UpdatedAt: now,
 		}
 		if err := store.create(child); err != nil {
@@ -139,7 +130,7 @@ func TestSQLJobStoreAssignsStableChildIndexes(t *testing.T) {
 	assertChildIndex(t, db, "child-a", 0)
 	assertChildIndex(t, db, "child-b", 1)
 
-	childA, ok, err := store.get("child-a", resolveJobOwnerUser, parent.UserID, now)
+	childA, ok, err := store.get("child-a", now)
 	if err != nil || !ok {
 		t.Fatalf("get child-a = ok %v, err %v", ok, err)
 	}
@@ -177,7 +168,7 @@ func TestSQLJobStoreMarksNonterminalJobsInterrupted(t *testing.T) {
 	}
 
 	for _, id := range []string{"restart-a", "restart-b", "restart-c"} {
-		job, ok, err := store.get(id, resolveJobOwnerAdmin, "ignored", restartedAt)
+		job, ok, err := store.get(id, restartedAt)
 		if err != nil || !ok {
 			t.Fatalf("get %s = ok %v, err %v", id, ok, err)
 		}
@@ -193,7 +184,7 @@ func TestSQLJobStoreMarksNonterminalJobsInterrupted(t *testing.T) {
 		}
 	}
 
-	completed, ok, err := store.get("restart-d", resolveJobOwnerAdmin, "ignored", restartedAt)
+	completed, ok, err := store.get("restart-d", restartedAt)
 	if err != nil || !ok || completed.Status != JobCompleted {
 		t.Fatalf("completed job changed = %#v, ok %v, err %v", completed, ok, err)
 	}
@@ -203,7 +194,7 @@ func TestSQLJobStoreScrubsDetailsAndDeletesRecords(t *testing.T) {
 	store, db, now := newTestSQLJobStore(t)
 	job := &Job{
 		ID: "expiring", Kind: ResourceMagnet, Mode: "direct", Input: "secret magnet",
-		Status: JobCompleted, Stage: StageComplete, UserID: "user-1",
+		Status: JobCompleted, Stage: StageComplete,
 		Result: &JobResult{ProxyToken: "expiring-token"}, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := store.create(job); err != nil {
@@ -216,7 +207,7 @@ func TestSQLJobStoreScrubsDetailsAndDeletesRecords(t *testing.T) {
 	if count, err := store.scrubExpired(now.Add(resolveJobDetailsTTL)); err != nil || count != 1 {
 		t.Fatalf("due scrub = %d, %v; want 1, nil", count, err)
 	}
-	if _, ok, err := store.get(job.ID, resolveJobOwnerUser, job.UserID, now.Add(resolveJobDetailsTTL)); err != nil || ok {
+	if _, ok, err := store.get(job.ID, now.Add(resolveJobDetailsTTL)); err != nil || ok {
 		t.Fatalf("get scrubbed details = ok %v, err %v; want false, nil", ok, err)
 	}
 
@@ -243,7 +234,7 @@ func TestSQLJobStorePreservesBatchResultAccountIDs(t *testing.T) {
 	store, _, now := newTestSQLJobStore(t)
 	job := &Job{
 		ID: "batch-accounts", Kind: ResourceBatch, Mode: "proxy",
-		Status: JobCompleted, Stage: StageComplete, UserID: "user-1",
+		Status: JobCompleted, Stage: StageComplete,
 		Results: []JobResult{
 			{ProxyToken: "token-a", AccountID: "account-a"},
 			{ProxyToken: "token-b", AccountID: "account-b"},
@@ -253,30 +244,12 @@ func TestSQLJobStorePreservesBatchResultAccountIDs(t *testing.T) {
 	if err := store.create(job); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	got, ok, err := store.get(job.ID, resolveJobOwnerUser, job.UserID, now)
+	got, ok, err := store.get(job.ID, now)
 	if err != nil || !ok {
 		t.Fatalf("get = ok %v, err %v", ok, err)
 	}
 	if len(got.Results) != 2 || got.Results[0].AccountID != "account-a" || got.Results[1].AccountID != "account-b" {
 		t.Fatalf("result account IDs = %#v", got.Results)
-	}
-}
-
-func TestSQLJobStoreListsCDKJobsWithNormalizedCode(t *testing.T) {
-	store, _, now := newTestSQLJobStore(t)
-	job := &Job{
-		ID: "cdk-job", Kind: ResourceMagnet, Mode: "direct", CDKCode: "  ab-cd  ",
-		Status: JobCompleted, Stage: StageComplete, CreatedAt: now, UpdatedAt: now,
-	}
-	if err := store.create(job); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	jobs, err := store.listByCDK("AB-CD", now)
-	if err != nil {
-		t.Fatalf("list by CDK: %v", err)
-	}
-	if len(jobs) != 1 || jobs[0].ID != job.ID {
-		t.Fatalf("CDK jobs = %#v", jobs)
 	}
 }
 
@@ -312,7 +285,7 @@ func TestSQLJobStoreRotatesPreviousKeyPayloads(t *testing.T) {
 
 	currentOnly := newTestSecretCipher(t, currentKey)
 	currentStore := newSQLJobStore(db, currentOnly)
-	got, ok, err := currentStore.get(job.ID, resolveJobOwnerAdmin, resolveJobOwnerAdmin, now)
+	got, ok, err := currentStore.get(job.ID, now)
 	if err != nil || !ok || got.Input != job.Input {
 		t.Fatalf("read with current key = %#v, ok %v, err %v", got, ok, err)
 	}
@@ -338,8 +311,7 @@ func fullSQLJobFixture(now time.Time) *Job {
 		Input: "https://mypikpak.com/s/clean", OriginalInput: "https://mypikpak.com/s/clean?pwd=raw",
 		PassCode: "pass-code", Status: JobCompleted, Stage: StageComplete,
 		Message: "complete", Error: "non-sensitive failure detail", BaseURL: "https://service.example",
-		FolderID: "folder-id", CDKCode: "CDK-IGNORED-FOR-USER", UserID: "user-1",
-		ProxyAllowed: true, AccountID: "job-account",
+		FolderID: "folder-id", AccountID: "job-account",
 		Share: &ShareState{
 			ShareID: "share-id", TailID: "tail-id", PassCodeToken: "pass-code-token",
 			SelectedID: "selected-id", SelectedIDs: []string{"selected-a", "selected-b"},

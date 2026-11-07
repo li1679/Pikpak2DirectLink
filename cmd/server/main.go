@@ -39,6 +39,10 @@ func run() error {
 		return nil
 	}
 
+	if err := cfg.ValidateLocal(); err != nil {
+		return err
+	}
+
 	server, err := app.NewServer(cfg)
 	if err != nil {
 		return fmt.Errorf("create server: %w", err)
@@ -55,13 +59,6 @@ func run() error {
 	if !cfg.IsConfigured() {
 		log.Printf("no bootstrap credentials detected; use the account management page to add PikPak accounts")
 	}
-	if cfg.HasFixedPassword() {
-		log.Printf("access password is pinned via ACCESS_PASSWORD; the first-visitor setup flow is disabled")
-	} else if setupURL := server.InitialSetupURL(); setupURL != "" {
-		log.Printf("initial setup URL (expires 30 minutes after startup; use locally or through an SSH tunnel): %s", setupURL)
-	} else if server.InitialSetupRequired() {
-		log.Printf("initial setup is unavailable on %s; bind ADDR to a loopback address or set ACCESS_PASSWORD, then restart", cfg.Addr)
-	}
 
 	httpServer := newHTTPServer(cfg.Addr, server.Handler())
 	serveErr := make(chan error, 1)
@@ -75,7 +72,7 @@ func run() error {
 	case sig := <-signals:
 		log.Printf("received %s; shutting down", sig)
 	case <-server.RestartRequested():
-		log.Printf("online update installed; shutting down for restart")
+		log.Printf("storage recovery requested; shutting down safely")
 	case err := <-serveErr:
 		if !errors.Is(err, http.ErrServerClosed) {
 			return err

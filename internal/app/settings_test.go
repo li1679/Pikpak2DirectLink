@@ -19,16 +19,11 @@ func newTestSettingsServer(t *testing.T, cfg Config) *Server {
 
 	minTimeout := minResolveTaskTimeout(cfg)
 	serialTimeout, parallelTimeout := normalizeResolveTimeouts(60*time.Second, 2*time.Minute, minTimeout)
-	cipher, err := NewSecretCipher(testDataEncryptionKey, nil)
-	if err != nil {
-		t.Fatalf("NewSecretCipher: %v", err)
-	}
 	return &Server{
-		config:     cfg,
-		resolver:   newResolveQueue(serialTimeout, parallelTimeout, 1, nil),
-		settings:   newSettingsStore(db),
-		appSecrets: newAppSecretStore(db, cipher),
-		logs:       newLogStore(10),
+		config:   cfg,
+		resolver: newResolveQueue(serialTimeout, parallelTimeout, 1, nil),
+		settings: newSettingsStore(db),
+		logs:     newLogStore(10),
 	}
 }
 
@@ -88,44 +83,5 @@ func TestUpdateSettingsAcceptsDynamicMinimum(t *testing.T) {
 	}
 	if payload := s.settingsPayload(); payload.MinTaskTimeoutS != int(minTimeout.Seconds()) {
 		t.Fatalf("min timeout payload = %d, want %d", payload.MinTaskTimeoutS, int(minTimeout.Seconds()))
-	}
-}
-
-func TestAuthSettingsSecretWriteOnly(t *testing.T) {
-	t.Parallel()
-
-	s := newTestSettingsServer(t, Config{})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/api/settings/auth", nil)
-	s.handleGetAuthSettings(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("get status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"linuxdo_configured":false`) ||
-		!strings.Contains(rec.Body.String(), `"linuxdo_login_enabled":true`) {
-		t.Fatalf("unexpected initial auth settings: %s", rec.Body.String())
-	}
-
-	rec = httptest.NewRecorder()
-	req = jsonRequest(http.MethodPut, "/api/settings/auth", `{"linuxdo_client_id":"cid","linuxdo_client_secret":"secret","email_registration_enabled":true}`)
-	s.handleUpdateAuthSettings(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("update status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	body := rec.Body.String()
-	if strings.Contains(body, `"linuxdo_client_secret":"`) || strings.Contains(body, `:"secret"`) {
-		t.Fatalf("secret must not be returned: %s", body)
-	}
-	if !strings.Contains(body, `"linuxdo_configured":true`) ||
-		!strings.Contains(body, `"linuxdo_client_secret_configured":true`) ||
-		!strings.Contains(body, `"email_registration_enabled":true`) {
-		t.Fatalf("unexpected updated auth settings: %s", body)
-	}
-	var count int
-	if err := s.settings.db.QueryRow(`SELECT COUNT(*) FROM settings WHERE value='secret'`).Scan(&count); err != nil {
-		t.Fatalf("scan plaintext settings: %v", err)
-	}
-	if count != 0 {
-		t.Fatal("LinuxDo client secret was stored in plaintext settings")
 	}
 }

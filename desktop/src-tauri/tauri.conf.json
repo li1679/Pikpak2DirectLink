@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PikPak Personal",
+  "version": "1.0.1",
+  "identifier": "com.pikpak.personal.desktop",
+  "build": { "frontendDist": "../ui" },
+  "app": {
+    "windows": [],
+    "withGlobalTauri": false,
+    "security": { "capabilities": [], "csp": "default-src 'none'; style-src 'unsafe-inline'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "PikPak Personal",
+    "shortDescription": "本机个人 PikPak 直链工具",
+    "externalBin": ["binaries/pikpak-service"],
+    "icon": ["icons/icon.ico", "icons/32x32.png", "icons/128x128.png"],
+    "windows": {
+      "webviewInstallMode": { "type": "embedBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "PikPak Personal",
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  }
+}

@@ -73,7 +73,7 @@ func TestJobStoreStopsServingExpiredTerminalDetailsFromCache(t *testing.T) {
 	if _, ok, err := store.getWithError(job.ID); err != nil || ok {
 		t.Fatalf("expired cache read = ok %v, err %v; want false, nil", ok, err)
 	}
-	record, ok, err := durable.getRecord(job.ID, resolveJobOwnerAdmin, resolveJobOwnerAdmin, now.Add(resolveJobDetailsTTL))
+	record, ok, err := durable.getRecord(job.ID, now.Add(resolveJobDetailsTTL))
 	if err != nil || !ok || record.DetailsAvailable {
 		t.Fatalf("expired metadata = %#v, ok %v, err %v", record, ok, err)
 	}

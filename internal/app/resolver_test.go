@@ -18,15 +18,15 @@ func TestResolveQueuePriorityOrdering(t *testing.T) {
 
 	// Enqueue interleaved priorities; the worker is never started, so entries
 	// stay put and we can inspect dispatch order directly.
-	q.enqueue("u1", priorityUser, noop)
-	q.enqueue("u2", priorityUser, noop)
-	q.enqueue("a1", priorityAdmin, noop)
+	q.enqueue("u1", priorityNormal, noop)
+	q.enqueue("u2", priorityNormal, noop)
+	q.enqueue("a1", priorityNormal, noop)
 	q.enqueue("r1", priorityResume, noop)
-	q.enqueue("a2", priorityAdmin, noop)
-	q.enqueue("u3", priorityUser, noop)
+	q.enqueue("a2", priorityNormal, noop)
+	q.enqueue("u3", priorityNormal, noop)
 
 	got := q.queuedIDs()
-	want := []string{"r1", "a1", "a2", "u1", "u2", "u3"}
+	want := []string{"r1", "u1", "u2", "a1", "a2", "u3"}
 	if len(got) != len(want) {
 		t.Fatalf("expected %v, got %v", want, got)
 	}
@@ -42,8 +42,8 @@ func TestResolveQueuePosition(t *testing.T) {
 
 	q := newResolveQueue(time.Second, time.Second, 1, nil)
 	noop := func(context.Context) {}
-	q.enqueue("u1", priorityUser, noop)
-	q.enqueue("u2", priorityUser, noop)
+	q.enqueue("u1", priorityNormal, noop)
+	q.enqueue("u2", priorityNormal, noop)
 
 	// Idle worker: the head reports 0 ahead.
 	if got := q.position("u1"); got != 0 {
@@ -99,11 +99,11 @@ func TestResolveQueueRunsSerially(t *testing.T) {
 
 	const total = 5
 	wg.Add(total)
-	q.enqueue("u1", priorityUser, makeRun())
-	q.enqueue("u2", priorityUser, makeRun())
-	q.enqueue("a1", priorityAdmin, makeRun())
+	q.enqueue("u1", priorityNormal, makeRun())
+	q.enqueue("u2", priorityNormal, makeRun())
+	q.enqueue("a1", priorityNormal, makeRun())
 	q.enqueue("r1", priorityResume, makeRun())
-	q.enqueue("u3", priorityUser, makeRun())
+	q.enqueue("u3", priorityNormal, makeRun())
 
 	done := make(chan struct{})
 	go func() {
@@ -157,7 +157,7 @@ func TestResolveQueueRunsInParallel(t *testing.T) {
 	const total = 9
 	wg.Add(total)
 	for i := 0; i < total; i++ {
-		q.enqueue("j"+strconv.Itoa(i), priorityUser, makeRun())
+		q.enqueue("j"+strconv.Itoa(i), priorityNormal, makeRun())
 	}
 
 	done := make(chan struct{})
@@ -185,9 +185,9 @@ func TestResolveQueueParallelPosition(t *testing.T) {
 	// the queue must wait for one running job to finish, then positions step by 1.
 	q := newResolveQueue(time.Second, time.Second, 2, nil)
 	noop := func(context.Context) {}
-	q.enqueue("w1", priorityUser, noop)
-	q.enqueue("w2", priorityUser, noop)
-	q.enqueue("w3", priorityUser, noop)
+	q.enqueue("w1", priorityNormal, noop)
+	q.enqueue("w2", priorityNormal, noop)
+	q.enqueue("w3", priorityNormal, noop)
 
 	q.mu.Lock()
 	q.running["r1"] = true
@@ -260,14 +260,14 @@ func TestResolveQueueShutdownCancelsActiveAndDrainsQueued(t *testing.T) {
 	}
 
 	go q.run()
-	if err := q.enqueue("active", priorityUser, func(ctx context.Context) {
+	if err := q.enqueue("active", priorityNormal, func(ctx context.Context) {
 		close(started)
 		<-ctx.Done()
 		canceled <- ctx.Err()
 	}); err != nil {
 		t.Fatalf("enqueue active job: %v", err)
 	}
-	if err := q.enqueue("queued", priorityUser, func(context.Context) {
+	if err := q.enqueue("queued", priorityNormal, func(context.Context) {
 		queuedRan <- struct{}{}
 	}); err != nil {
 		t.Fatalf("enqueue queued job: %v", err)
@@ -326,7 +326,7 @@ func TestResolveQueueShutdownWaitsForWorker(t *testing.T) {
 	release := make(chan struct{})
 	go q.run()
 
-	if err := q.enqueue("active", priorityUser, func(ctx context.Context) {
+	if err := q.enqueue("active", priorityNormal, func(ctx context.Context) {
 		close(started)
 		<-ctx.Done()
 		close(canceled)
@@ -368,14 +368,14 @@ func TestResolveQueueRejectsEnqueueAfterShutdown(t *testing.T) {
 		failed[jobID]++
 	})
 
-	if err := q.enqueue("pending", priorityUser, func(context.Context) {
+	if err := q.enqueue("pending", priorityNormal, func(context.Context) {
 		t.Fatal("drained job ran")
 	}); err != nil {
 		t.Fatalf("enqueue pending job: %v", err)
 	}
 	q.shutdown()
 	q.shutdown()
-	err := q.enqueue("late", priorityUser, func(context.Context) {
+	err := q.enqueue("late", priorityNormal, func(context.Context) {
 		t.Fatal("rejected job ran")
 	})
 	if !errors.Is(err, errResolveQueueClosed) {

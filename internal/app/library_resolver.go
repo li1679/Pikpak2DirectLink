@@ -51,7 +51,7 @@ func (s *Server) newLibraryJob(entry *LibraryEntry, target *DownloadItem, mode, 
 			return nil, err
 		}
 	}
-	err = s.admission.withCapacity("", 1, func() error { return s.jobs.create(job) })
+	err = s.admission.withCapacity(1, func() error { return s.jobs.create(job) })
 	return job, err
 }
 
@@ -67,7 +67,7 @@ func (s *Server) startLibraryDiscovery(id string) {
 		s.recordLibraryDiscoveryFailure(id, err)
 		return
 	}
-	err = s.resolver.enqueue(job.ID, priorityAdmin, func(ctx context.Context) {
+	err = s.resolver.enqueue(job.ID, priorityNormal, func(ctx context.Context) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				s.failJob(job.ID, fmt.Errorf("文件库检查异常：%v", recovered))
@@ -222,7 +222,7 @@ func (s *Server) libraryDownloadJob(entry *LibraryEntry, file *LibraryFile, mode
 	}
 	call := &libraryDownload{done: make(chan struct{}), jobID: job.ID}
 	s.libraryDownloads[token] = call
-	err = s.resolver.enqueue(job.ID, priorityUser, func(ctx context.Context) {
+	err = s.resolver.enqueue(job.ID, priorityNormal, func(ctx context.Context) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				s.failJob(job.ID, fmt.Errorf("文件下载解析异常：%v", recovered))

@@ -1,5 +1,29 @@
 # Changelog
 
+## Desktop v1.0.1 — 2026-11-07
+
+- 图标改为黑底白字的小写 `pikpak`，同步页面图标、Windows EXE 与安装包资源。
+- 添加统一图标生成脚本，桌面构建时自动同步各尺寸资源。
+- 功能、数据目录和密钥保持不变。
+
+## Desktop v1.0.0 — 2026-11-07
+
+- 新增 Windows x64 Tauri/WebView2 窗口与当前用户 NSIS 安装包。
+- 自动管理 Go 后台生命周期；单实例，正常退出和父进程异常退出均回收后台。
+- 桌面数据独立保存在本机用户目录；自动生成并通过 DPAPI 保护密钥。
+- 新增原生数据/日志目录、恢复密钥导出和个人版数据库备份恢复菜单。
+- 保留原命令行入口；不添加开机启动、自更新或旧数据导入。
+
+## Personal fork — 当前版本
+
+- 改为仅本机使用、免项目注册登录；保留 PikPak 账号登录与账号池。
+- 删除管理员密码、OAuth、订阅和用户配额、CDK、在线更新及相关前后端和数据库结构。
+- 仅使用全新个人版数据库；删除旧库迁移、JSON 导入和旧格式兼容读取。
+- 保留解析、批次和多选、文件库、直链 / 本机代理、aria2、日志、设置、备份恢复。
+- 该阶段的桌面化已在后续 Desktop v1.0.0 中完成。
+
+以下为上游历史记录，不代表当前个人版功能或升级路径。
+
 ## v3.4.0 - 2026-11-05 - Configurable community OAuth login
 
 - Add administrator-managed OAuth providers with custom names, endpoints, scopes, field mappings, ordering, registration controls, and encrypted client secrets.

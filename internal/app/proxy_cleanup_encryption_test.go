@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-func TestProxyTempCleanupStoreEncryptsAndMigratesFileIDs(t *testing.T) {
+func TestProxyTempCleanupStoreEncryptsFileIDs(t *testing.T) {
 	db, err := openDatabase(t.TempDir() + "/cleanup.db")
 	if err != nil {
 		t.Fatalf("open database: %v", err)
@@ -23,23 +23,12 @@ func TestProxyTempCleanupStoreEncryptsAndMigratesFileIDs(t *testing.T) {
 	}
 	assertCleanupPayloadEncrypted(t, db, "job-encrypted", "private-file-id")
 
-	if _, err := db.Exec(`INSERT INTO proxy_temp_cleanups
-		(id, job_id, account_id, file_ids_json, cleanup_after, attempts, created_at)
-		VALUES(?,?,?,?,?,?,?)`, "legacy-cleanup", "job-legacy", "account-1",
-		`["legacy-private-id"]`, now.Unix(), 0, now.Unix()); err != nil {
-		t.Fatalf("insert legacy cleanup: %v", err)
-	}
-	if err := store.RotateSecrets(); err != nil {
-		t.Fatalf("rotate cleanup secrets: %v", err)
-	}
-	assertCleanupPayloadEncrypted(t, db, "job-legacy", "legacy-private-id")
-
 	records, err := store.due(now, 10)
 	if err != nil {
 		t.Fatalf("read due cleanups: %v", err)
 	}
-	if len(records) != 2 {
-		t.Fatalf("due cleanup count = %d, want 2", len(records))
+	if len(records) != 1 {
+		t.Fatalf("due cleanup count = %d, want 1", len(records))
 	}
 }
 
@@ -77,77 +66,24 @@ func TestProxyTempCleanupStoreSeparatesAccountsForOneJob(t *testing.T) {
 	}
 }
 
-func TestProxyTempCleanupRotateMergesLegacyRowsByJobAndAccount(t *testing.T) {
+func TestProxyTempCleanupStoreRejectsPlaintextPayload(t *testing.T) {
 	db, err := openDatabase(t.TempDir() + "/cleanup.db")
 	if err != nil {
-		t.Fatalf("open database: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	cipher := newTestSecretCipher(t, bytes.Repeat([]byte{0x52}, secretKeySize))
-	store := newProxyTempCleanupStore(db, cipher)
-	now := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
-
-	encryptedDuplicate, err := cipher.Encrypt(proxyTempCleanupPurpose, "legacy-b", []byte(`["file-b","shared"]`))
-	if err != nil {
-		t.Fatalf("encrypt legacy duplicate: %v", err)
+	store := newProxyTempCleanupStore(db, newTestSecretCipher(t, bytes.Repeat([]byte{0x52}, secretKeySize)))
+	now := time.Now()
+	if _, err := db.Exec(`INSERT INTO proxy_temp_cleanups
+		(id,job_id,account_id,file_ids_json,cleanup_after,attempts,created_at)
+		VALUES(?,?,?,?,?,?,?)`, cleanupRecordID("job", "account"), "job", "account", `["private-id"]`, now.Unix(), 0, now.Unix()); err != nil {
+		t.Fatal(err)
 	}
-	legacyRows := []struct {
-		id, jobID, accountID, payload, lastError string
-		cleanupAfter, createdAt                  time.Time
-		attempts                                 int
-	}{
-		{"legacy-a", "merge-job", "account-a", `["file-a","shared"]`, "first", now.Add(time.Hour), now, 1},
-		{"legacy-b", "merge-job", "account-a", encryptedDuplicate, "latest", now.Add(2 * time.Hour), now.Add(-time.Hour), 4},
-		{"legacy-c", "merge-job", "account-b", `["file-c"]`, "", now.Add(30 * time.Minute), now.Add(-2 * time.Hour), 2},
+	if _, err := store.due(now, 10); err == nil {
+		t.Fatal("plaintext cleanup payload was accepted")
 	}
-	for _, row := range legacyRows {
-		if _, err := db.Exec(`INSERT INTO proxy_temp_cleanups
-			(id,job_id,account_id,file_ids_json,cleanup_after,attempts,last_error,created_at)
-			VALUES(?,?,?,?,?,?,?,?)`, row.id, row.jobID, row.accountID, row.payload,
-			row.cleanupAfter.Unix(), row.attempts, row.lastError, row.createdAt.Unix()); err != nil {
-			t.Fatalf("insert %s: %v", row.id, err)
-		}
-	}
-
-	if err := store.RotateSecrets(); err != nil {
-		t.Fatalf("rotate cleanup secrets: %v", err)
-	}
-	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM proxy_temp_cleanups`).Scan(&count); err != nil {
-		t.Fatalf("count migrated rows: %v", err)
-	}
-	if count != 2 {
-		t.Fatalf("migrated row count = %d, want 2", count)
-	}
-
-	id := cleanupRecordID("merge-job", "account-a")
-	var payload, lastError string
-	var cleanupUnix, createdUnix int64
-	var attempts int
-	if err := db.QueryRow(`SELECT file_ids_json,cleanup_after,attempts,
-		COALESCE(last_error,''),created_at FROM proxy_temp_cleanups WHERE id=?`, id).
-		Scan(&payload, &cleanupUnix, &attempts, &lastError, &createdUnix); err != nil {
-		t.Fatalf("read merged row: %v", err)
-	}
-	ids, err := store.decodeFileIDs(id, payload)
-	if err != nil {
-		t.Fatalf("decode merged IDs: %v", err)
-	}
-	if !sameCleanupIDs(ids, []string{"file-a", "file-b", "shared"}) {
-		t.Fatalf("merged IDs = %v", ids)
-	}
-	if cleanupUnix != now.Add(2*time.Hour).Unix() || createdUnix != now.Add(-time.Hour).Unix() || attempts != 4 || lastError != "latest" {
-		t.Fatalf("merged metadata = cleanup %d, created %d, attempts %d, error %q", cleanupUnix, createdUnix, attempts, lastError)
-	}
-	if !strings.HasPrefix(payload, secretEnvelopeVersion+".") || strings.Contains(payload, "file-a") {
-		t.Fatalf("merged payload is not encrypted: %q", payload)
-	}
-	var legacyCount int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM proxy_temp_cleanups WHERE id IN ('legacy-a','legacy-b','legacy-c')`).Scan(&legacyCount); err != nil {
-		t.Fatalf("count legacy IDs: %v", err)
-	}
-	if legacyCount != 0 {
-		t.Fatalf("legacy row count = %d, want 0", legacyCount)
+	if err := store.RotateSecrets(); err == nil {
+		t.Fatal("plaintext payload was converted instead of rejected")
 	}
 }
 

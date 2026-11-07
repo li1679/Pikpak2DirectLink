@@ -2,10 +2,10 @@
 import { computed } from 'vue'
 import { CheckCircle2, XCircle, AlertTriangle, Users, Loader2 } from 'lucide-vue-next'
 import SignalTrack from './SignalTrack.vue'
-import type { Job, UserJobView } from '../lib/types'
+import type { Job } from '../lib/types'
 
 const props = defineProps<{
-  job: Job | UserJobView | null
+  job: Job | null
   phase: string
   error: string
   submitting?: boolean
@@ -20,7 +20,7 @@ const batchPct = computed(() => {
   return Math.round(((b.succeeded + b.failed) / b.total) * 100)
 })
 const attempts = computed(() =>
-  props.showAttempts ? ((props.job as Job | null)?.account_attempts ?? []) : [],
+  props.showAttempts ? (props.job?.account_attempts ?? []) : [],
 )
 </script>
 

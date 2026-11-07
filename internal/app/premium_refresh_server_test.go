@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,7 +38,7 @@ func TestListAccountsReturnsCachedDataWhilePremiumRefreshRuns(t *testing.T) {
 	}
 	now := time.Now().UTC()
 	pool := &AccountPool{
-		config: AccountPoolConfig{AccountsFile: filepath.Join(t.TempDir(), "accounts.json")},
+		store: newAccountStore(openAccountStoreTestDatabase(t), newTestSecretCipher(t, []byte("0123456789abcdef0123456789abcdef"))),
 		accounts: map[string]*accountState{
 			"account": {
 				record: accountRecord{ID: "account", Username: "account@example.com", CreatedAt: now, UpdatedAt: now},

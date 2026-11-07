@@ -8,10 +8,9 @@ import (
 )
 
 const (
-	appSecretPurpose        = "app-secret"
-	dataKeyCheckName        = "data-encryption-key-check-v1"
-	dataKeyCheckPlaintext   = "pikpak2directlink:data-key:v1"
-	linuxDoClientSecretName = "linuxdo-client-secret"
+	appSecretPurpose      = "app-secret"
+	dataKeyCheckName      = "data-encryption-key-check-v1"
+	dataKeyCheckPlaintext = "pikpak2directlink:data-key:v1"
 )
 
 type appSecretStore struct {
@@ -146,37 +145,6 @@ func (s *appSecretStore) rotateSecrets() error {
 			}
 			return fmt.Errorf("app secret %q changed during rotation", item.key)
 		}
-	}
-	return tx.Commit()
-}
-
-func (s *appSecretStore) migrateLinuxDoSecret(settings *settingsStore) error {
-	if _, exists, err := s.get(linuxDoClientSecretName); err != nil {
-		return err
-	} else if exists {
-		return settings.delete(settingKeyLinuxDoClientSecret)
-	}
-	legacy := settings.getString(settingKeyLinuxDoClientSecret, "")
-	if legacy == "" {
-		return nil
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	ciphertext, err := s.cipher.Encrypt(appSecretPurpose, linuxDoClientSecretName, []byte(legacy))
-	if err != nil {
-		return err
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO app_secrets(key,ciphertext,updated_at) VALUES(?,?,?)`,
-		linuxDoClientSecretName, ciphertext, time.Now().Unix(),
-	); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM settings WHERE key=?`, settingKeyLinuxDoClientSecret); err != nil {
-		return err
 	}
 	return tx.Commit()
 }

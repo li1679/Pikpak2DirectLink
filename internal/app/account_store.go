@@ -18,7 +18,7 @@ const (
 )
 
 const accountColumns = `
-	id, username, password_encrypted, session_file, status, premium,
+	id, username, password_encrypted, status, premium,
 	premium_type, premium_until, premium_error, premium_checked_at,
 	traffic_limit, traffic_used, traffic_period, last_error, last_failed_at,
 	credential_checked_at, credential_next_check_at, credential_check_error,
@@ -136,68 +136,6 @@ func (s *accountStore) Replace(records []accountRecord) error {
 	return nil
 }
 
-// ImportLegacy inserts a complete legacy account set and its opaque sessions
-// in one transaction. It refuses a non-empty destination so a failed or
-// repeated migration can never merge two sources silently.
-func (s *accountStore) ImportLegacy(records []accountRecord, sessions map[string][]byte) error {
-	if err := s.validate(); err != nil {
-		return err
-	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := s.importLegacyTx(tx, records, sessions); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-func (s *accountStore) importLegacyTx(tx *sql.Tx, records []accountRecord, sessions map[string][]byte) error {
-	prepared := make([]storedAccountRecord, 0, len(records))
-	seen := make(map[string]struct{}, len(records))
-	for _, record := range records {
-		if _, exists := seen[record.ID]; exists {
-			return fmt.Errorf("import legacy accounts: duplicate account id %q", record.ID)
-		}
-		item, err := s.prepareAccount(record)
-		if err != nil {
-			return err
-		}
-		seen[record.ID] = struct{}{}
-		prepared = append(prepared, item)
-	}
-
-	var existing int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM pikpak_accounts`).Scan(&existing); err != nil {
-		return err
-	}
-	if existing != 0 {
-		return errors.New("import legacy accounts: destination is not empty")
-	}
-	for order, item := range prepared {
-		if err := insertAccount(tx, item, order); err != nil {
-			return err
-		}
-		data, ok := sessions[item.record.ID]
-		if !ok {
-			continue
-		}
-		encrypted, err := s.cipher.Encrypt(accountSessionSecretPurpose, item.record.ID, data)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO pikpak_account_sessions(account_id,session_encrypted,updated_at) VALUES(?,?,?)`,
-			item.record.ID, encrypted, s.now().Unix(),
-		); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // Insert appends an account to the current order.
 func (s *accountStore) Insert(record accountRecord) error {
 	if err := s.validate(); err != nil {
@@ -295,7 +233,7 @@ func (s *accountStore) updateWithExecutor(executor accountUpdateExecutor, record
 
 	result, err := executor.Exec(`
 		UPDATE pikpak_accounts SET
-			username = ?, password_encrypted = ?, session_file = ?, status = ?, premium = ?,
+			username = ?, password_encrypted = ?, status = ?, premium = ?,
 			premium_type = ?, premium_until = ?, premium_error = ?, premium_checked_at = ?,
 			traffic_limit = ?, traffic_used = ?, traffic_period = ?, last_error = ?, last_failed_at = ?,
 			credential_checked_at = ?, credential_next_check_at = ?, credential_check_error = ?,
@@ -449,7 +387,7 @@ func (s *accountStore) scanAccount(scanner rowScanner) (accountRecord, error) {
 		updatedAt         int64
 	)
 	if err := scanner.Scan(
-		&record.ID, &record.Username, &passwordEncrypted, &record.SessionFile,
+		&record.ID, &record.Username, &passwordEncrypted,
 		&record.Status, &premium, &record.PremiumType, &record.PremiumUntil,
 		&record.PremiumError, &record.PremiumCheckedAt, &record.TrafficLimit,
 		&record.TrafficUsed, &record.TrafficPeriod, &record.LastError,
@@ -477,12 +415,12 @@ func (s *accountStore) scanAccount(scanner rowScanner) (accountRecord, error) {
 func insertAccount(tx *sql.Tx, item storedAccountRecord, order int) error {
 	_, err := tx.Exec(`
 		INSERT INTO pikpak_accounts(
-			id, sort_order, username, password_encrypted, session_file, status, premium,
+			id, sort_order, username, password_encrypted, status, premium,
 			premium_type, premium_until, premium_error, premium_checked_at,
 			traffic_limit, traffic_used, traffic_period, last_error, last_failed_at,
 			credential_checked_at, credential_next_check_at, credential_check_error,
 			parse_errors_json, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		accountValueArgs(item, true, order)...,
 	)
 	return err
@@ -491,17 +429,16 @@ func insertAccount(tx *sql.Tx, item storedAccountRecord, order int) error {
 func upsertAccount(tx *sql.Tx, item storedAccountRecord, order int) error {
 	_, err := tx.Exec(`
 		INSERT INTO pikpak_accounts(
-			id, sort_order, username, password_encrypted, session_file, status, premium,
+			id, sort_order, username, password_encrypted, status, premium,
 			premium_type, premium_until, premium_error, premium_checked_at,
 			traffic_limit, traffic_used, traffic_period, last_error, last_failed_at,
 			credential_checked_at, credential_next_check_at, credential_check_error,
 			parse_errors_json, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			sort_order = excluded.sort_order,
 			username = excluded.username,
 			password_encrypted = excluded.password_encrypted,
-			session_file = excluded.session_file,
 			status = excluded.status,
 			premium = excluded.premium,
 			premium_type = excluded.premium_type,
@@ -529,7 +466,6 @@ func accountValueArgs(item storedAccountRecord, includeIdentity bool, order ...i
 	values := []any{
 		record.Username,
 		item.passwordEncrypted,
-		record.SessionFile,
 		string(record.Status),
 		boolInt(record.Premium),
 		record.PremiumType,

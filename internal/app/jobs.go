@@ -63,11 +63,8 @@ type JobResult struct {
 	ProxyURL   string       `json:"proxy_url"`
 	ProxyToken string       `json:"proxy_token"`
 	ExpiresAt  string       `json:"expires_at,omitempty"`
-	// AccountID records which PikPak account produced this link. The single-file
-	// and CDK-batch paths leave it empty (the job's own AccountID applies), but a
-	// multi-link parent merges results from several children that may each have
-	// used a different account, so the proxy handler needs it to re-fetch a fresh
-	// direct link after expiry.
+	// AccountID identifies the PikPak account that produced this result. Batch
+	// parents merge results from different accounts, so proxy refreshes use it.
 	AccountID string `json:"-"`
 }
 
@@ -128,9 +125,6 @@ type Job struct {
 	Error            string           `json:"error,omitempty"`
 	BaseURL          string           `json:"-"`
 	FolderID         string           `json:"-"`
-	CDKCode          string           `json:"-"`
-	UserID           string           `json:"-"`
-	ProxyAllowed     bool             `json:"-"`
 	AccountID        string           `json:"account_id,omitempty"`
 	Share            *ShareState      `json:"share,omitempty"`
 	Items            []DownloadItem   `json:"items,omitempty"`
@@ -163,9 +157,7 @@ type Job struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 }
 
-// resultForToken returns the resolved file whose proxy token matches, searching
-// both the single-file Result (admin path) and the multi-file Results (registered-user
-// batch path). Returns nil when no token matches.
+// resultForToken finds a file in a single-file or batch result set.
 func (j *Job) resultForToken(token string) *JobResult {
 	if token == "" {
 		return nil
@@ -259,29 +251,20 @@ func (s *jobStore) firstEvictableLocked() int {
 	return -1
 }
 
-func (s *jobStore) admissionCounts(userID, excludeID string) (global, user, selections int) {
+func (s *jobStore) activeCount() int {
 	if s == nil {
-		return 0, 0, 0
+		return 0
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for id, job := range s.jobs {
-		if id == excludeID || job == nil || isTerminalJobStatus(job.Status) {
+	count := 0
+	for _, job := range s.jobs {
+		if job == nil || isTerminalJobStatus(job.Status) || job.Kind == ResourceBatch && job.ParentID == "" {
 			continue
 		}
-		// A batch parent coordinates child results but consumes no resolver slot.
-		if job.Kind == ResourceBatch && job.ParentID == "" {
-			continue
-		}
-		global++
-		if userID != "" && job.UserID == userID {
-			user++
-			if job.Status == JobSelectionRequired {
-				selections++
-			}
-		}
+		count++
 	}
-	return global, user, selections
+	return count
 }
 
 func (s *jobStore) expiredSelectionIDs(cutoff time.Time) []string {
@@ -322,7 +305,7 @@ func (s *jobStore) getWithError(id string) (*Job, bool, error) {
 		return nil, false, nil
 	}
 
-	stored, found, err := s.durable.getAny(id, s.durable.currentTime())
+	stored, found, err := s.durable.get(id, s.durable.currentTime())
 	if err != nil {
 		return nil, false, err
 	}
@@ -415,7 +398,7 @@ func (s *jobStore) updateAtomic(db *sql.DB, id string, fn func(*Job) error, extr
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		stored, found, readErr := s.durable.getAny(id, s.durable.currentTime())
+		stored, found, readErr := s.durable.get(id, s.durable.currentTime())
 		if readErr == nil && found && sameJobPayload(stored, updated) {
 			s.jobs[id] = stored
 			return cloneJob(stored), nil

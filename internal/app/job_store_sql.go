@@ -14,9 +14,6 @@ const (
 	resolveJobRecordTTL  = 30 * 24 * time.Hour
 
 	resolveJobPayloadPurpose = "resolve_jobs.payload"
-	resolveJobOwnerAdmin     = "admin"
-	resolveJobOwnerUser      = "user"
-	resolveJobOwnerCDK       = "cdk"
 )
 
 const resolveJobRestartError = "service restarted before the job completed"
@@ -41,8 +38,6 @@ type resolveJobWriteMetadata struct {
 type resolveJobRecord struct {
 	ID               string
 	ParentID         string
-	OwnerType        string
-	OwnerID          string
 	Kind             ResourceKind
 	Mode             string
 	Status           JobStatus
@@ -67,8 +62,7 @@ func newSQLJobStore(db *sql.DB, cipher *SecretCipher) *sqlJobStore {
 
 // resolveJobPayload deliberately mirrors Job instead of marshaling Job
 // directly. Several runtime fields use json:"-" and are required after a
-// database read for ownership checks, proxy refreshes, cleanup, and restart
-// handling.
+// database read for proxy refreshes, cleanup, and restart handling.
 type resolveJobPayload struct {
 	ID               string                    `json:"id"`
 	Kind             ResourceKind              `json:"kind"`
@@ -82,9 +76,6 @@ type resolveJobPayload struct {
 	Error            string                    `json:"error"`
 	BaseURL          string                    `json:"base_url"`
 	FolderID         string                    `json:"folder_id"`
-	CDKCode          string                    `json:"cdk_code"`
-	UserID           string                    `json:"user_id"`
-	ProxyAllowed     bool                      `json:"proxy_allowed"`
 	AccountID        string                    `json:"account_id"`
 	Share            *resolveJobSharePayload   `json:"share"`
 	Items            []DownloadItem            `json:"items"`
@@ -172,7 +163,6 @@ func (s *sqlJobStore) writeTx(tx *sql.Tx, job *Job, createOnly bool, metadata []
 	copyJob := cloneJob(job)
 	copyJob.ID = strings.TrimSpace(copyJob.ID)
 	copyJob.ParentID = strings.TrimSpace(copyJob.ParentID)
-	ownerType, ownerID := resolveJobOwner(copyJob)
 
 	existing, err := readExistingResolveJob(tx, copyJob.ID)
 	if err != nil {
@@ -230,7 +220,7 @@ func (s *sqlJobStore) writeTx(tx *sql.Tx, job *Job, createOnly bool, metadata []
 	completedValue := nullableUnix(completedAt)
 	detailsValue := nullableUnix(detailsExpiresAt)
 	args := []any{
-		copyJob.ID, parentValue, childValue, ownerType, ownerID,
+		copyJob.ID, parentValue, childValue,
 		string(copyJob.Kind), copyJob.Mode, string(copyJob.Status), string(copyJob.Stage),
 		strings.TrimSpace(meta.FailureCode), strings.TrimSpace(meta.ErrorCategory), resolveJobClearError(copyJob),
 		resolveJobResultCount(copyJob), meta.ChargedBytes, payload, detailsValue,
@@ -239,21 +229,19 @@ func (s *sqlJobStore) writeTx(tx *sql.Tx, job *Job, createOnly bool, metadata []
 
 	if createOnly {
 		_, err = tx.Exec(`INSERT INTO resolve_jobs (
-			id, parent_job_id, child_index, owner_type, owner_id, kind, mode,
+			id, parent_job_id, child_index, kind, mode,
 			status, phase, failure_code, error_category, error_message,
 			result_count, charged_bytes, payload_encrypted, details_expires_at,
 			record_expires_at, created_at, updated_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
 	} else {
 		_, err = tx.Exec(`INSERT INTO resolve_jobs (
-			id, parent_job_id, child_index, owner_type, owner_id, kind, mode,
+			id, parent_job_id, child_index, kind, mode,
 			status, phase, failure_code, error_category, error_message,
 			result_count, charged_bytes, payload_encrypted, details_expires_at,
 			record_expires_at, created_at, updated_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			owner_type=excluded.owner_type,
-			owner_id=excluded.owner_id,
 			kind=excluded.kind,
 			mode=excluded.mode,
 			status=excluded.status,
@@ -275,46 +263,25 @@ func (s *sqlJobStore) writeTx(tx *sql.Tx, job *Job, createOnly bool, metadata []
 	return nil
 }
 
-// get performs the ownership check in SQL before decrypting the payload.
-func (s *sqlJobStore) get(id, ownerType, ownerID string, now time.Time) (*Job, bool, error) {
-	record, ok, err := s.getRecord(id, ownerType, ownerID, now)
+func (s *sqlJobStore) get(id string, now time.Time) (*Job, bool, error) {
+	record, ok, err := s.getRecord(id, now)
 	if err != nil || !ok || !record.DetailsAvailable {
 		return nil, false, err
 	}
 	return cloneJob(record.Job), true, nil
 }
 
-func (s *sqlJobStore) getAny(id string, now time.Time) (*Job, bool, error) {
-	record, ok, err := s.loadRecord(id, "", "", now)
-	if err != nil || !ok || !record.DetailsAvailable {
-		return nil, false, err
-	}
-	return cloneJob(record.Job), true, nil
-}
+const resolveJobColumns = `id, COALESCE(parent_job_id, ''),
+	kind, mode, status, phase, failure_code, error_category, error_message,
+	result_count, charged_bytes, payload_encrypted, details_expires_at,
+	record_expires_at, created_at, updated_at, completed_at`
 
-func (s *sqlJobStore) getRecord(id, ownerType, ownerID string, now time.Time) (resolveJobRecord, bool, error) {
-	ownerType, ownerID, err := normalizeResolveJobOwner(ownerType, ownerID)
-	if err != nil {
-		return resolveJobRecord{}, false, err
-	}
-	return s.loadRecord(id, ownerType, ownerID, now)
-}
-
-func (s *sqlJobStore) loadRecord(id, ownerType, ownerID string, now time.Time) (resolveJobRecord, bool, error) {
+func (s *sqlJobStore) getRecord(id string, now time.Time) (resolveJobRecord, bool, error) {
 	if s == nil || s.db == nil || s.cipher == nil {
 		return resolveJobRecord{}, false, nil
 	}
-	query := `SELECT id, COALESCE(parent_job_id, ''), owner_type, owner_id,
-		kind, mode, status, phase, failure_code, error_category, error_message,
-		result_count, charged_bytes, payload_encrypted, details_expires_at,
-		record_expires_at, created_at, updated_at, completed_at
-		FROM resolve_jobs WHERE id=? AND record_expires_at>?`
-	args := []any{strings.TrimSpace(id), now.Unix()}
-	if ownerType != "" {
-		query += ` AND owner_type=? AND owner_id=?`
-		args = append(args, ownerType, ownerID)
-	}
-	record, err := s.scanRecord(s.db.QueryRow(query, args...), now)
+	record, err := s.scanRecord(s.db.QueryRow(`SELECT `+resolveJobColumns+`
+		FROM resolve_jobs WHERE id=? AND record_expires_at>?`, strings.TrimSpace(id), now.Unix()), now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return resolveJobRecord{}, false, nil
 	}
@@ -324,47 +291,12 @@ func (s *sqlJobStore) loadRecord(id, ownerType, ownerID string, now time.Time) (
 	return record, true, nil
 }
 
-func (s *sqlJobStore) listByUser(userID string, now time.Time) ([]*Job, error) {
-	return s.list(resolveJobOwnerUser, strings.TrimSpace(userID), now)
-}
-
-func (s *sqlJobStore) listByCDK(code string, now time.Time) ([]*Job, error) {
-	return s.list(resolveJobOwnerCDK, normalizeCode(code), now)
-}
-
-func (s *sqlJobStore) list(ownerType, ownerID string, now time.Time) ([]*Job, error) {
-	records, err := s.listRecords(ownerType, ownerID, now, false)
-	if err != nil {
-		return nil, err
-	}
-	var jobs []*Job
-	for _, record := range records {
-		if record.DetailsAvailable {
-			jobs = append(jobs, cloneJob(record.Job))
-		}
-	}
-	return jobs, nil
-}
-
-func (s *sqlJobStore) listHistoryByUser(userID string, now time.Time) ([]resolveJobRecord, error) {
-	return s.listRecords(resolveJobOwnerUser, strings.TrimSpace(userID), now, true)
-}
-
-func (s *sqlJobStore) listRecords(ownerType, ownerID string, now time.Time, terminalRootsOnly bool) ([]resolveJobRecord, error) {
+func (s *sqlJobStore) listRecords(now time.Time, terminalRootsOnly bool) ([]resolveJobRecord, error) {
 	if s == nil || s.db == nil || s.cipher == nil {
 		return nil, nil
 	}
-	ownerType, ownerID, err := normalizeResolveJobOwner(ownerType, ownerID)
-	if err != nil {
-		return nil, err
-	}
-	query := `SELECT id, COALESCE(parent_job_id, ''), owner_type, owner_id,
-		kind, mode, status, phase, failure_code, error_category, error_message,
-		result_count, charged_bytes, payload_encrypted, details_expires_at,
-		record_expires_at, created_at, updated_at, completed_at
-		FROM resolve_jobs
-		WHERE owner_type=? AND owner_id=? AND record_expires_at>?`
-	args := []any{ownerType, ownerID, now.Unix()}
+	query := `SELECT ` + resolveJobColumns + ` FROM resolve_jobs WHERE record_expires_at>?`
+	args := []any{now.Unix()}
 	if terminalRootsOnly {
 		query += ` AND parent_job_id IS NULL AND status IN (?, ?)`
 		args = append(args, string(JobCompleted), string(JobFailed))
@@ -375,7 +307,6 @@ func (s *sqlJobStore) listRecords(ownerType, ownerID string, now time.Time, term
 		return nil, err
 	}
 	defer rows.Close()
-
 	var records []resolveJobRecord
 	for rows.Next() {
 		record, err := s.scanRecord(rows, now)
@@ -417,7 +348,7 @@ func (s *sqlJobStore) foldCompletedChildren(now time.Time) (int64, error) {
 
 	var folded int64
 	for _, parentID := range parentIDs {
-		parentRecord, ok, err := s.loadRecord(parentID, "", "", now)
+		parentRecord, ok, err := s.getRecord(parentID, now)
 		if err != nil {
 			return folded, err
 		}
@@ -453,7 +384,7 @@ func (s *sqlJobStore) foldCompletedChildren(now time.Time) (int64, error) {
 		allTerminal := true
 		var chargedBytes int64
 		for index, childID := range childIDs {
-			childRecord, ok, err := s.loadRecord(childID, "", "", now)
+			childRecord, ok, err := s.getRecord(childID, now)
 			if err != nil {
 				return folded, err
 			}
@@ -465,7 +396,7 @@ func (s *sqlJobStore) foldCompletedChildren(now time.Time) (int64, error) {
 				progress.Succeeded++
 				chargedBytes += childRecord.ChargedBytes
 				label := batchLinkLabel(index+1, childRecord.Job.Input, childRecord.Job.Kind)
-				for _, result := range historyResultsFromJob(childRecord.Job) {
+				for _, result := range jobResults(childRecord.Job) {
 					merged := result
 					merged.File.Path = label + "/" + childResultPath(result.File)
 					if merged.ProxyToken != "" {
@@ -531,7 +462,7 @@ func (s *sqlJobStore) scanRecord(scanner resolveJobRecordScanner, now time.Time)
 		updatedAt      int64
 	)
 	if err := scanner.Scan(
-		&record.ID, &record.ParentID, &record.OwnerType, &record.OwnerID,
+		&record.ID, &record.ParentID,
 		&record.Kind, &record.Mode, &record.Status, &record.Stage,
 		&record.FailureCode, &record.ErrorCategory, &record.ErrorMessage,
 		&record.ResultCount, &record.ChargedBytes, &encrypted, &detailsExpires,
@@ -793,34 +724,6 @@ func resolveJobCompletionTimes(job *Job, existing existingResolveJob, now time.T
 	}
 }
 
-func resolveJobOwner(job *Job) (string, string) {
-	if userID := strings.TrimSpace(job.UserID); userID != "" {
-		return resolveJobOwnerUser, userID
-	}
-	if code := normalizeCode(job.CDKCode); code != "" {
-		return resolveJobOwnerCDK, code
-	}
-	return resolveJobOwnerAdmin, resolveJobOwnerAdmin
-}
-
-func normalizeResolveJobOwner(ownerType, ownerID string) (string, string, error) {
-	ownerType = strings.ToLower(strings.TrimSpace(ownerType))
-	switch ownerType {
-	case resolveJobOwnerUser:
-		ownerID = strings.TrimSpace(ownerID)
-	case resolveJobOwnerCDK:
-		ownerID = normalizeCode(ownerID)
-	case resolveJobOwnerAdmin:
-		ownerID = resolveJobOwnerAdmin
-	default:
-		return "", "", errors.New("invalid resolve job owner type")
-	}
-	if ownerID == "" {
-		return "", "", errors.New("resolve job owner ID is required")
-	}
-	return ownerType, ownerID, nil
-}
-
 func resolveJobResultCount(job *Job) int {
 	if job == nil {
 		return 0
@@ -871,8 +774,7 @@ func resolveJobPayloadFromJob(job *Job) resolveJobPayload {
 		ID: job.ID, Kind: job.Kind, Mode: job.Mode, Input: job.Input,
 		OriginalInput: job.OriginalInput, PassCode: job.PassCode,
 		Status: job.Status, Stage: job.Stage, Message: job.Message, Error: job.Error,
-		BaseURL: job.BaseURL, FolderID: job.FolderID, CDKCode: job.CDKCode,
-		UserID: job.UserID, ProxyAllowed: job.ProxyAllowed, AccountID: job.AccountID,
+		BaseURL: job.BaseURL, FolderID: job.FolderID, AccountID: job.AccountID,
 		Items:           append([]DownloadItem(nil), job.Items...),
 		AccountAttempts: append([]AccountAttempt(nil), job.AccountAttempts...),
 		Warnings:        append([]string(nil), job.Warnings...), QueueAhead: job.QueueAhead,
@@ -912,8 +814,7 @@ func (p resolveJobPayload) job() *Job {
 		ID: p.ID, Kind: p.Kind, Mode: p.Mode, Input: p.Input,
 		OriginalInput: p.OriginalInput, PassCode: p.PassCode,
 		Status: p.Status, Stage: p.Stage, Message: p.Message, Error: p.Error,
-		BaseURL: p.BaseURL, FolderID: p.FolderID, CDKCode: p.CDKCode,
-		UserID: p.UserID, ProxyAllowed: p.ProxyAllowed, AccountID: p.AccountID,
+		BaseURL: p.BaseURL, FolderID: p.FolderID, AccountID: p.AccountID,
 		Items:           append([]DownloadItem(nil), p.Items...),
 		AccountAttempts: append([]AccountAttempt(nil), p.AccountAttempts...),
 		Warnings:        append([]string(nil), p.Warnings...), QueueAhead: p.QueueAhead,

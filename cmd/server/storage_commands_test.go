@@ -76,12 +76,18 @@ func writeCommandTestDatabase(t *testing.T, path, value string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL)`); err != nil {
-		db.Close()
+	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO schema_migrations(version,name,applied_at) VALUES(1,'secure_storage_foundation',0)`); err != nil {
-		db.Close()
+	server, err := app.NewServer(app.Config{Addr: "127.0.0.1:51873", DBFile: path, BackupDir: filepath.Join(filepath.Dir(path), "backups"), DataEncryptionKey: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = sql.Open("sqlite", path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TABLE marker(value TEXT NOT NULL)`); err != nil {
@@ -94,5 +100,12 @@ func writeCommandTestDatabase(t *testing.T, path, value string) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRunStorageCommandRejectsRemovedMigrationCommand(t *testing.T) {
+	handled, err := runStorageCommandWithOutput([]string{"storage", "restore-migration", "--backup", "old", "--yes"}, app.Config{}, &bytes.Buffer{})
+	if !handled || err == nil || !strings.Contains(err.Error(), "unknown storage command") {
+		t.Fatalf("handled=%v err=%v", handled, err)
 	}
 }

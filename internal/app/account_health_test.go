@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -104,10 +103,8 @@ func newAccountHealthTestServer(t *testing.T, now time.Time) *Server {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	dir := t.TempDir()
 	pool, err := NewAccountPool(AccountPoolConfig{
-		AccountsFile:   filepath.Join(dir, "accounts.json"),
-		SessionDir:     filepath.Join(dir, "sessions"),
+		Store:          newAccountStore(db, newTestSecretCipher(t, []byte("0123456789abcdef0123456789abcdef"))),
 		RootFolderName: "Pikpak2DirectLink",
 		RequestTimeout: time.Second,
 	})

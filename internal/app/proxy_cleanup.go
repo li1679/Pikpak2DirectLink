@@ -161,16 +161,12 @@ func (s *proxyTempCleanupStore) due(now time.Time, limit int) ([]proxyTempCleanu
 }
 
 func (s *proxyTempCleanupStore) decodeFileIDs(id, stored string) ([]string, error) {
-	data := []byte(stored)
-	if strings.HasPrefix(stored, secretEnvelopeVersion+".") {
-		if s.cipher == nil {
-			return nil, errors.New("cleanup file IDs are encrypted but no cipher is configured")
-		}
-		plaintext, err := s.cipher.Decrypt(proxyTempCleanupPurpose, id, stored)
-		if err != nil {
-			return nil, fmt.Errorf("decrypt cleanup file IDs %q: %w", id, err)
-		}
-		data = plaintext
+	if s.cipher == nil {
+		return nil, errors.New("cleanup encryption is required")
+	}
+	data, err := s.cipher.Decrypt(proxyTempCleanupPurpose, id, stored)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt cleanup file IDs %q: %w", id, err)
 	}
 	var ids []string
 	if err := json.Unmarshal(data, &ids); err != nil {
@@ -185,7 +181,7 @@ func (s *proxyTempCleanupStore) encodeFileIDs(id string, ids []string) (string, 
 		return "", err
 	}
 	if s.cipher == nil {
-		return string(data), nil
+		return "", errors.New("cleanup encryption is required")
 	}
 	encoded, err := s.cipher.Encrypt(proxyTempCleanupPurpose, id, data)
 	if err != nil {
@@ -194,8 +190,7 @@ func (s *proxyTempCleanupStore) encodeFileIDs(id string, ids []string) (string, 
 	return encoded, nil
 }
 
-// RotateSecrets canonicalizes legacy/random records by job and account while
-// rotating every payload to the current key and its new record-bound AAD.
+// RotateSecrets re-encrypts current cleanup records with the active key.
 func (s *proxyTempCleanupStore) RotateSecrets() error {
 	if s == nil || s.db == nil || s.cipher == nil {
 		return nil
@@ -205,104 +200,37 @@ func (s *proxyTempCleanupStore) RotateSecrets() error {
 		return err
 	}
 	defer tx.Rollback()
-
-	rows, err := tx.Query(`SELECT id,job_id,account_id,file_ids_json,cleanup_after,
-		attempts,COALESCE(last_error, ''),created_at
-		FROM proxy_temp_cleanups ORDER BY created_at,id`)
+	rows, err := tx.Query(`SELECT id,file_ids_json FROM proxy_temp_cleanups`)
 	if err != nil {
 		return err
 	}
-	type cleanupStoredRecord struct {
-		id           string
-		jobID        string
-		accountID    string
-		stored       string
-		cleanupAfter int64
-		attempts     int
-		lastError    string
-		createdAt    int64
-	}
-	var records []cleanupStoredRecord
+	type record struct{ id, payload string }
+	var records []record
 	for rows.Next() {
-		var record cleanupStoredRecord
-		if err := rows.Scan(
-			&record.id, &record.jobID, &record.accountID, &record.stored,
-			&record.cleanupAfter, &record.attempts, &record.lastError, &record.createdAt,
-		); err != nil {
+		var rec record
+		if err := rows.Scan(&rec.id, &rec.payload); err != nil {
 			rows.Close()
 			return err
 		}
-		records = append(records, record)
+		records = append(records, rec)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
-
-	type cleanupMergedRecord struct {
-		id           string
-		jobID        string
-		accountID    string
-		fileIDs      []string
-		cleanupAfter int64
-		attempts     int
-		lastError    string
-		createdAt    int64
-	}
-	groups := make(map[string]*cleanupMergedRecord, len(records))
-	var groupOrder []string
-	for _, record := range records {
-		ids, err := s.decodeFileIDs(record.id, record.stored)
+	for _, rec := range records {
+		ids, err := s.decodeFileIDs(rec.id, rec.payload)
 		if err != nil {
 			return err
 		}
-		jobID := strings.TrimSpace(record.jobID)
-		accountID := strings.TrimSpace(record.accountID)
-		key := jobID + "\x00" + accountID
-		merged := groups[key]
-		if merged == nil {
-			merged = &cleanupMergedRecord{
-				id: cleanupRecordID(jobID, accountID), jobID: jobID, accountID: accountID,
-				cleanupAfter: record.cleanupAfter, attempts: record.attempts,
-				lastError: record.lastError, createdAt: record.createdAt,
-			}
-			groups[key] = merged
-			groupOrder = append(groupOrder, key)
-		} else {
-			if record.cleanupAfter > merged.cleanupAfter {
-				merged.cleanupAfter = record.cleanupAfter
-			}
-			if record.createdAt < merged.createdAt {
-				merged.createdAt = record.createdAt
-			}
-			if record.attempts > merged.attempts {
-				merged.attempts = record.attempts
-				merged.lastError = record.lastError
-			} else if record.attempts == merged.attempts && record.lastError != "" {
-				merged.lastError = record.lastError
-			}
-		}
-		merged.fileIDs = uniqueStrings(append(merged.fileIDs, ids...))
-	}
-
-	if _, err := tx.Exec(`DELETE FROM proxy_temp_cleanups`); err != nil {
-		return err
-	}
-	for _, key := range groupOrder {
-		merged := groups[key]
-		encoded, err := s.encodeFileIDs(merged.id, merged.fileIDs)
+		encoded, err := s.encodeFileIDs(rec.id, ids)
 		if err != nil {
 			return err
 		}
-		var lastError any
-		if merged.lastError != "" {
-			lastError = merged.lastError
-		}
-		if _, err := tx.Exec(`INSERT INTO proxy_temp_cleanups
-			(id,job_id,account_id,file_ids_json,cleanup_after,attempts,last_error,created_at)
-			VALUES(?,?,?,?,?,?,?,?)`,
-			merged.id, merged.jobID, merged.accountID, encoded, merged.cleanupAfter,
-			merged.attempts, lastError, merged.createdAt,
-		); err != nil {
+		if _, err := tx.Exec(`UPDATE proxy_temp_cleanups SET file_ids_json=? WHERE id=?`, encoded, rec.id); err != nil {
 			return err
 		}
 	}

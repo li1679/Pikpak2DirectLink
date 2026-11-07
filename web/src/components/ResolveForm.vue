@@ -7,7 +7,6 @@ const props = defineProps<{
   loading?: boolean
   disabled?: boolean
   compact?: boolean
-  allowProxy?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -24,7 +23,7 @@ const isBatch = computed(() => lineCount.value > 1)
 function onSubmit() {
   if (props.loading || props.disabled) return
   if (!input.value.trim()) return
-  emit('submit', { input: input.value, passCode: passCode.value, mode: props.allowProxy ? mode.value : 'direct' })
+  emit('submit', { input: input.value, passCode: passCode.value, mode: mode.value })
 }
 </script>
 
@@ -53,8 +52,8 @@ https://mypikpak.com/s/...
           <input v-model="mode" type="radio" value="direct" />
           <span><Link2 />Direct</span>
         </label>
-        <label class="seg-item" :class="{ off: !allowProxy }" :title="allowProxy ? 'Proxy' : 'No proxy quota'">
-          <input v-model="mode" type="radio" value="proxy" :disabled="!allowProxy" />
+        <label class="seg-item">
+          <input v-model="mode" type="radio" value="proxy" />
           <span><Waypoints />Proxy</span>
         </label>
       </div>
@@ -76,7 +75,6 @@ https://mypikpak.com/s/...
 .mode-seg { width: 100%; }
 .mode-seg .seg-item { flex: 1 1 0; }
 .mode-seg .seg-item span { width: 100%; justify-content: center; }
-.mode-seg .off { opacity: 0.55; cursor: not-allowed; }
 
 @media (max-width: 760px) {
   .rform { grid-template-columns: 1fr; }

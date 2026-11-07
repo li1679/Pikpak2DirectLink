@@ -6,41 +6,38 @@ import (
 )
 
 func TestDurableHistoryRetainsMetadataAfterDetailExpiry(t *testing.T) {
-	durable, db, now := newTestSQLJobStore(t)
-	history := newResolveHistoryStore(db, durable)
+	durable, _, now := newTestSQLJobStore(t)
 	job := &Job{
-		ID: "history-durable", Kind: ResourceMagnet, Mode: "direct",
-		Input: "magnet:?xt=urn:btih:private", UserID: "user-history",
-		Status: JobFailed, Stage: StageFailed, FailureCode: "service_restart",
-		Error: resolveJobRestartError, ChargedBytes: 456,
+		ID: "history-durable", Kind: ResourceMagnet, Mode: "direct", Input: "magnet:?xt=urn:btih:private",
+		Status: JobFailed, Stage: StageFailed, FailureCode: "service_restart", Error: resolveJobRestartError, ChargedBytes: 456,
 		CreatedAt: now.Add(-time.Minute), UpdatedAt: now,
 	}
 	if err := durable.create(job); err != nil {
-		t.Fatalf("create durable history job: %v", err)
+		t.Fatal(err)
 	}
-
-	items, err := history.listByUser(job.UserID, now.Add(time.Minute))
+	items, err := durable.listRecords(now.Add(time.Minute), true)
 	if err != nil || len(items) != 1 {
-		t.Fatalf("history before expiry = %#v, err %v", items, err)
+		t.Fatalf("history before expiry=%+v err=%v", items, err)
 	}
 	if !items[0].DetailsAvailable || items[0].FailureCode != "service_restart" || items[0].ChargedBytes != 456 {
-		t.Fatalf("history metadata before expiry = %#v", items[0])
+		t.Fatalf("history metadata=%+v", items[0])
 	}
-
 	expiredAt := now.Add(resolveJobDetailsTTL)
-	items, err = history.listByUser(job.UserID, expiredAt)
+	items, err = durable.listRecords(expiredAt, true)
 	if err != nil || len(items) != 1 {
-		t.Fatalf("history after detail expiry = %#v, err %v", items, err)
+		t.Fatalf("history after details expire=%+v err=%v", items, err)
 	}
-	if items[0].DetailsAvailable || items[0].Input != "" || items[0].FailureCode != "service_restart" {
-		t.Fatalf("scrubbed history metadata = %#v", items[0])
+	if items[0].DetailsAvailable || items[0].Job != nil || items[0].FailureCode != "service_restart" || items[0].ChargedBytes != 456 {
+		t.Fatalf("expired history metadata=%+v", items[0])
 	}
-	if _, ok, err := history.getByUser(job.UserID, job.ID, expiredAt); !ok || err != errResolveJobDetailsExpired {
-		t.Fatalf("expired history detail = ok %v, err %v", ok, err)
+	if _, ok, err := durable.get(job.ID, expiredAt); ok || err != nil {
+		t.Fatalf("expired detail lookup: ok=%v err=%v", ok, err)
 	}
-
-	items, err = history.listByUser(job.UserID, now.Add(resolveJobRecordTTL))
+	if record, ok, err := durable.getRecord(job.ID, expiredAt); !ok || err != nil || record.DetailsAvailable {
+		t.Fatalf("retained metadata=%+v ok=%v err=%v", record, ok, err)
+	}
+	items, err = durable.listRecords(now.Add(resolveJobRecordTTL), true)
 	if err != nil || len(items) != 0 {
-		t.Fatalf("history after record expiry = %#v, err %v", items, err)
+		t.Fatalf("history after record expiry=%+v err=%v", items, err)
 	}
 }

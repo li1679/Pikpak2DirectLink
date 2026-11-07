@@ -3,12 +3,8 @@ package app
 import (
 	"context"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -26,18 +22,13 @@ const (
 	AccountFailed    AccountStatus = "failed"
 )
 
-// bytesPerGB is the byte count of one "G" of traffic. We use the binary
-// gibibyte (1024³) consistently for both account limits and CDK allowances, so
-// it lines up with the byte sizes PikPak reports for files.
+// bytesPerGB is the binary gibibyte (1024³), matching PikPak file sizes.
 const bytesPerGB = int64(1) << 30
 
-// defaultAccountTraffic is the monthly downstream-traffic budget assigned to a
-// new account (or an older record that predates traffic tracking): 700G.
+// defaultAccountTraffic is the monthly downstream-traffic budget: 700 GiB.
 const defaultAccountTraffic = 700 * bytesPerGB
 
 type AccountPoolConfig struct {
-	AccountsFile   string
-	SessionDir     string
 	RootFolderName string
 	RequestTimeout time.Duration
 	Store          *accountStore
@@ -96,7 +87,6 @@ type accountRecord struct {
 	ID                    string        `json:"id"`
 	Username              string        `json:"username"`
 	Password              string        `json:"password"`
-	SessionFile           string        `json:"session_file"`
 	Status                AccountStatus `json:"status"`
 	Premium               bool          `json:"premium"`
 	PremiumType           string        `json:"premium_type,omitempty"`
@@ -154,13 +144,11 @@ const (
 const badResourceParseUserError = "该磁链连续遇到解析错误，请不要反复重试此链接。"
 
 func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
-	cfg.AccountsFile = strings.TrimSpace(cfg.AccountsFile)
-	if cfg.AccountsFile == "" {
-		cfg.AccountsFile = "data/pikpak-accounts.json"
+	if cfg.Store == nil {
+		return nil, errors.New("SQLite account storage is required")
 	}
-	cfg.SessionDir = strings.TrimSpace(cfg.SessionDir)
-	if cfg.SessionDir == "" {
-		cfg.SessionDir = "data/accounts"
+	if err := cfg.Store.validate(); err != nil {
+		return nil, err
 	}
 
 	pool := &AccountPool{
@@ -168,9 +156,7 @@ func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 		accounts: make(map[string]*accountState),
 		store:    cfg.Store,
 	}
-	if cfg.Store != nil {
-		pool.recordReplacer = cfg.Store
-	}
+	pool.recordReplacer = cfg.Store
 	if err := pool.load(); err != nil {
 		return nil, err
 	}
@@ -186,15 +172,8 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 		trafficLimit = defaultAccountTraffic
 	}
 
-	id, sessionFile := p.accountIdentity(username)
-	var staged *stagingSessionStore
-	var client *pikpak.Client
-	if p.store != nil {
-		staged = newStagingSessionStore()
-		client = p.newClientWithSessionStore(username, password, staged)
-	} else {
-		client = p.newClient(id, username, password, sessionFile)
-	}
+	staged := newStagingSessionStore()
+	client := p.newClientWithSessionStore(username, password, staged)
 	if err := client.Login(ctx, username, password); err != nil {
 		return AccountSummary{}, err
 	}
@@ -202,7 +181,7 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	snapshot := p.snapshotLocked()
+	id := p.accountIdentityLocked(username)
 
 	now := time.Now()
 	existingState, existed := p.accounts[id]
@@ -215,7 +194,6 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 		ID:                    id,
 		Username:              username,
 		Password:              password,
-		SessionFile:           sessionFile,
 		Status:                AccountAvailable,
 		TrafficLimit:          trafficLimit,
 		TrafficPeriod:         monthKey(now),
@@ -235,17 +213,14 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 		}
 	}
 	updatePremiumRecord(&record, premiumInfo, premiumErr, now)
-	if p.store != nil {
-		session, err := staged.Load()
-		if err != nil {
-			return AccountSummary{}, fmt.Errorf("read staged PikPak session: %w", err)
-		}
-		record.SessionFile = ""
-		if err := p.store.UpsertWithSession(record, session); err != nil {
-			return AccountSummary{}, err
-		}
-		client = p.newClient(id, username, password, "")
+	session, err := staged.Load()
+	if err != nil {
+		return AccountSummary{}, fmt.Errorf("read staged PikPak session: %w", err)
 	}
+	if err := p.store.UpsertWithSession(record, session); err != nil {
+		return AccountSummary{}, err
+	}
+	client = p.newClient(id, username, password)
 
 	p.accounts[id] = &accountState{
 		record: record,
@@ -254,66 +229,32 @@ func (p *AccountPool) Add(ctx context.Context, username, password string, traffi
 	if !existed {
 		p.order = append(p.order, id)
 	}
-	if p.store == nil {
-		if err := p.saveOrRollbackLocked(snapshot); err != nil {
-			return AccountSummary{}, err
-		}
-	}
 	return p.summaryLocked(id), nil
 }
 
-func (p *AccountPool) AddBootstrap(username, password, sessionFile string) error {
+func (p *AccountPool) AddBootstrap(username, password string) error {
 	username = strings.TrimSpace(username)
 	if username == "" || strings.TrimSpace(password) == "" {
 		return nil
 	}
-
-	id, defaultSessionFile := p.accountIdentity(username)
-	if strings.TrimSpace(sessionFile) == "" {
-		sessionFile = defaultSessionFile
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	snapshot := p.snapshotLocked()
-
+	id := p.accountIdentityLocked(username)
 	if _, ok := p.accounts[id]; ok {
 		return nil
 	}
-
 	now := time.Now()
 	record := accountRecord{
-		ID:                    id,
-		Username:              username,
-		Password:              password,
-		SessionFile:           sessionFile,
-		Status:                AccountAvailable,
-		TrafficLimit:          defaultAccountTraffic,
-		TrafficPeriod:         monthKey(now),
-		CredentialNextCheckAt: formatAccountTime(now),
-		CreatedAt:             now,
-		UpdatedAt:             now,
+		ID: id, Username: username, Password: password, Status: AccountAvailable,
+		TrafficLimit: defaultAccountTraffic, TrafficPeriod: monthKey(now),
+		CredentialNextCheckAt: formatAccountTime(now), CreatedAt: now, UpdatedAt: now,
 	}
-	if p.store != nil {
-		record.SessionFile = ""
-		if data, err := os.ReadFile(sessionFile); err == nil {
-			if err := p.store.UpsertWithSession(record, data); err != nil {
-				return err
-			}
-		} else if os.IsNotExist(err) {
-			if err := p.store.Insert(record); err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
+	if err := p.store.Insert(record); err != nil {
+		return err
 	}
-	p.accounts[id] = &accountState{record: record, client: p.newClient(id, username, password, sessionFile)}
+	p.accounts[id] = &accountState{record: record, client: p.newClient(id, username, password)}
 	p.order = append(p.order, id)
-	if p.store != nil {
-		return nil
-	}
-	return p.saveOrRollbackLocked(snapshot)
+	return nil
 }
 
 func (p *AccountPool) List() []AccountSummary {
@@ -653,11 +594,6 @@ func (p *AccountPool) Delete(id string) error {
 	if err := p.saveOrRollbackLocked(snapshot); err != nil {
 		return err
 	}
-	if p.store == nil {
-		if err := os.Remove(state.record.SessionFile); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -691,7 +627,8 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 		return AccountSummary{}, errors.New("account username or password is missing")
 	}
 
-	client := p.newClient(record.ID, record.Username, record.Password, record.SessionFile)
+	staged := newStagingSessionStore()
+	client := p.newClientWithSessionStore(record.Username, record.Password, staged)
 	if err := client.Login(ctx, record.Username, record.Password); err != nil {
 		return AccountSummary{}, err
 	}
@@ -704,18 +641,25 @@ func (p *AccountPool) RefreshLogin(ctx context.Context, id string) (AccountSumma
 	if state == nil {
 		return AccountSummary{}, errors.New("account not found")
 	}
-	snapshot := p.snapshotLocked()
-
+	if state.record.Username != record.Username || state.record.Password != record.Password {
+		return AccountSummary{}, errors.New("account credentials changed during login; retry")
+	}
+	session, err := staged.Load()
+	if err != nil {
+		return AccountSummary{}, fmt.Errorf("read staged PikPak session: %w", err)
+	}
 	now := time.Now()
-	state.client = client
-	state.record.Status = AccountAvailable
-	state.record.LastError = ""
-	state.record.LastFailedAt = ""
-	updatePremiumRecord(&state.record, premiumInfo, premiumErr, now)
-	state.record.UpdatedAt = now
-	if err := p.saveOrRollbackLocked(snapshot); err != nil {
+	updated := state.record
+	updated.Status = AccountAvailable
+	updated.LastError = ""
+	updated.LastFailedAt = ""
+	updatePremiumRecord(&updated, premiumInfo, premiumErr, now)
+	updated.UpdatedAt = now
+	if err := p.store.UpsertWithSession(updated, session); err != nil {
 		return AccountSummary{}, err
 	}
+	state.record = updated
+	state.client = p.newClient(id, updated.Username, updated.Password)
 	return p.summaryLocked(id), nil
 }
 
@@ -889,57 +833,14 @@ func (u *accountTrafficUpdate) finish(committed bool) {
 }
 
 func (p *AccountPool) load() error {
-	if p.store != nil {
-		records, err := p.store.List()
-		if err != nil {
-			return err
-		}
-		for _, record := range records {
-			recordCopy := record
-			p.accounts[record.ID] = &accountState{
-				record: recordCopy,
-				client: p.newClient(record.ID, record.Username, record.Password, ""),
-			}
-			p.order = append(p.order, record.ID)
-		}
-		return nil
-	}
-	data, err := os.ReadFile(p.config.AccountsFile)
+	records, err := p.store.List()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
 		return err
 	}
-
-	var records []accountRecord
-	if err := json.Unmarshal(data, &records); err != nil {
-		return err
-	}
-
 	for _, record := range records {
-		record.Username = strings.TrimSpace(record.Username)
-		if record.ID == "" || record.Username == "" {
-			continue
-		}
-		if record.SessionFile == "" {
-			record.SessionFile = filepath.Join(p.config.SessionDir, record.ID+".json")
-		}
-		if record.Status == "" {
-			record.Status = AccountAvailable
-		}
-		// Records created before traffic tracking get the default budget and the
-		// current month as their baseline period.
-		if record.TrafficLimit <= 0 {
-			record.TrafficLimit = defaultAccountTraffic
-		}
-		if record.TrafficPeriod == "" {
-			record.TrafficPeriod = monthKey(time.Now())
-		}
-		recordCopy := record
 		p.accounts[record.ID] = &accountState{
-			record: recordCopy,
-			client: p.newClient(record.ID, record.Username, record.Password, record.SessionFile),
+			record: record,
+			client: p.newClient(record.ID, record.Username, record.Password),
 		}
 		p.order = append(p.order, record.ID)
 	}
@@ -958,22 +859,7 @@ func (p *AccountPool) saveLocked() error {
 	if p.recordReplacer != nil {
 		return p.recordReplacer.Replace(records)
 	}
-	if p.store != nil {
-		return p.store.Replace(records)
-	}
-
-	data, err := json.MarshalIndent(records, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Dir(p.config.AccountsFile)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
-	}
-	return os.WriteFile(p.config.AccountsFile, data, 0o600)
+	return errors.New("account persistence is not initialized")
 }
 
 func (p *AccountPool) snapshotLocked() accountPoolSnapshot {
@@ -1037,19 +923,8 @@ func (p *AccountPool) summaryLocked(id string) AccountSummary {
 	}
 }
 
-func (p *AccountPool) newClient(id, username, password, sessionFile string) *pikpak.Client {
-	config := pikpak.Config{
-		Username:       username,
-		Password:       password,
-		SessionFile:    sessionFile,
-		RootFolderName: p.config.RootFolderName,
-		RequestTimeout: p.config.RequestTimeout,
-	}
-	if p.store != nil {
-		config.SessionFile = ""
-		config.SessionStore = p.store.SessionStore(id)
-	}
-	return pikpak.NewClient(config)
+func (p *AccountPool) newClient(id, username, password string) *pikpak.Client {
+	return p.newClientWithSessionStore(username, password, p.store.SessionStore(id))
 }
 
 func (p *AccountPool) newClientWithSessionStore(username, password string, store pikpak.SessionStore) *pikpak.Client {
@@ -1062,26 +937,15 @@ func (p *AccountPool) newClientWithSessionStore(username, password string, store
 	})
 }
 
-func (p *AccountPool) accountIdentity(username string) (id, sessionFile string) {
-	if p.store != nil {
-		normalized := strings.ToLower(strings.TrimSpace(username))
-		for existingID, state := range p.accounts {
-			if state != nil && strings.ToLower(strings.TrimSpace(state.record.Username)) == normalized {
-				return existingID, ""
-			}
+// accountIdentityLocked must be called with p.mu held.
+func (p *AccountPool) accountIdentityLocked(username string) string {
+	normalized := strings.ToLower(strings.TrimSpace(username))
+	for existingID, state := range p.accounts {
+		if state != nil && strings.ToLower(strings.TrimSpace(state.record.Username)) == normalized {
+			return existingID
 		}
-		return "acct_" + strings.ReplaceAll(uuid.NewString(), "-", ""), ""
 	}
-	id = accountIDForUsername(username)
-	return id, filepath.Join(p.config.SessionDir, id+".json")
-}
-
-func accountIDForUsername(username string) string {
-	username = strings.ToLower(strings.TrimSpace(username))
-	if username == "" {
-		return ""
-	}
-	return "acct_" + hex.EncodeToString([]byte(username))
+	return "acct_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 // monthKey is the calendar-month identifier used to scope traffic counters.

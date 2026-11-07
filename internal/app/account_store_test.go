@@ -324,7 +324,6 @@ func testAccountRecord(id, username, password string, day int) accountRecord {
 		ID:                    id,
 		Username:              username,
 		Password:              password,
-		SessionFile:           "legacy/" + id + ".json",
 		Status:                AccountAvailable,
 		Premium:               day%2 == 0,
 		PremiumType:           "vip",
@@ -411,4 +410,46 @@ func queryString(t *testing.T, db *sql.DB, query string, args ...any) string {
 
 func testEncodedKey(key []byte) string {
 	return base64.StdEncoding.EncodeToString(key)
+}
+
+func TestAccountStoreUpsertWithSessionRollsBackAsOneTransaction(t *testing.T) {
+	db := openAccountStoreTestDatabase(t)
+	store := newAccountStore(db, newTestSecretCipher(t, []byte("0123456789abcdef0123456789abcdef")))
+	record := testAccountRecord("atomic", "atomic@example.com", "original-password", 1)
+	if err := store.UpsertWithSession(record, []byte("original-session")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER reject_session BEFORE UPDATE ON pikpak_account_sessions BEGIN SELECT RAISE(ABORT, 'session write failed'); END`); err != nil {
+		t.Fatal(err)
+	}
+	changed := record
+	changed.Password = "changed-password"
+	if err := store.UpsertWithSession(changed, []byte("changed-session")); err == nil {
+		t.Fatal("upsert accepted a failed session write")
+	}
+	assertAccountRecords(t, store, []accountRecord{record})
+	if data, err := store.SessionStore(record.ID).Load(); err != nil || string(data) != "original-session" {
+		t.Fatalf("session changed after rollback: %q err=%v", data, err)
+	}
+}
+
+func TestAccountPoolReloadsEncryptedPikPakSession(t *testing.T) {
+	pool := newTrafficTestPool(t)
+	if err := pool.AddBootstrap("personal@example.com", "account-password"); err != nil {
+		t.Fatal(err)
+	}
+	id := pool.List()[0].ID
+	session := []byte(`{"username":"personal@example.com","access_token":"access-token","refresh_token":"refresh-token","user_id":"pikpak-user","device_id":"device","expires_at":"2099-01-01T00:00:00Z"}`)
+	if err := pool.store.SessionStore(id).Save(session); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewAccountPool(pool.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := reloaded.List()
+	if len(accounts) != 1 || !accounts[0].LoggedIn || !accounts[0].Persisted {
+		t.Fatalf("reloaded account=%+v", accounts)
+	}
+	assertEncryptedColumn(t, pool.store.db, `SELECT session_encrypted FROM pikpak_account_sessions WHERE account_id=?`, id, "refresh-token")
 }

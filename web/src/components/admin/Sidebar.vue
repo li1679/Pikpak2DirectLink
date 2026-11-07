@@ -1,22 +1,17 @@
 <script setup lang="ts">
-import { Radar, Link2, FolderOpen, Users, UserRoundSearch, Terminal, Ticket, Download, Settings, LogOut } from 'lucide-vue-next'
+import { Radar, Link2, FolderOpen, Users, Terminal, Settings } from 'lucide-vue-next'
 
 defineProps<{
   active: string
-  updateAvailable?: boolean
-  loggedIn?: boolean
 }>()
 
-const emit = defineEmits<{ (e: 'update:active', page: string): void; (e: 'logout'): void }>()
+const emit = defineEmits<{ (e: 'update:active', page: string): void }>()
 
 const nav = [
   { id: 'resolve', icon: Link2, tip: '解析' },
   { id: 'library', icon: FolderOpen, tip: '文件库' },
-  { id: 'accounts', icon: Users, tip: '账号' },
-  { id: 'users', icon: UserRoundSearch, tip: '注册用户' },
+  { id: 'accounts', icon: Users, tip: 'PikPak账号' },
   { id: 'logs', icon: Terminal, tip: '日志' },
-  { id: 'cdk', icon: Ticket, tip: 'CDK' },
-  { id: 'update', icon: Download, tip: '更新' },
   { id: 'settings', icon: Settings, tip: '设置' },
 ] as const
 </script>
@@ -33,19 +28,13 @@ const nav = [
         class="rbtn"
         :class="{ active: active === item.id }"
         :aria-label="item.tip"
+        :aria-current="active === item.id ? 'page' : undefined"
         :data-tip="item.tip"
         @click="emit('update:active', item.id)"
       >
         <component :is="item.icon" />
-        <span v-if="item.id === 'update' && updateAvailable" class="dot" />
       </button>
     </nav>
-
-    <div class="foot">
-      <button v-if="loggedIn" type="button" class="rbtn" aria-label="退出登录" data-tip="退出" @click="emit('logout')">
-        <LogOut />
-      </button>
-    </div>
   </aside>
 </template>
 
@@ -94,8 +83,6 @@ const nav = [
   content: ""; position: absolute; left: -9px; top: 50%; transform: translateY(-50%);
   width: 3px; height: 20px; border-radius: var(--r-pill); background: var(--brand);
 }
-.dot { position: absolute; top: 8px; right: 8px; width: 7px; height: 7px; border-radius: 50%; background: var(--live); animation: live-pulse 1.8s var(--ease) infinite; }
-.foot { display: flex; flex-direction: column; gap: 4px; }
 
 @media (max-width: 720px) {
   .rail {
@@ -105,7 +92,7 @@ const nav = [
     border: 1px solid var(--line); border-radius: var(--r-xl);
     box-shadow: var(--shadow-md); z-index: 50;
   }
-  .brand, .foot { display: none; }
+  .brand { display: none; }
   .nav { flex-direction: row; gap: 3px; }
   .rbtn { width: 37px; }
   .rbtn::after, .rbtn.active::before { display: none; }
