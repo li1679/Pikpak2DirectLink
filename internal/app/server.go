@@ -178,6 +178,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if err := tempCleanups.RotateSecrets(); err != nil {
 		return nil, fmt.Errorf("rotate proxy cleanup secrets: %w", err)
 	}
+	if err := tempCleanups.enforceRetentionLimit(); err != nil {
+		return nil, fmt.Errorf("apply six-hour resource retention: %w", err)
+	}
 	var backups *backupManager
 	if strings.TrimSpace(cfg.BackupDir) != "" {
 		backups = newBackupManager(db, cfg.DBFile, cfg.BackupDir, cfg.BackupInterval, cfg.BackupRetention)
@@ -418,25 +421,17 @@ func (s *Server) handleAddAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.RequestTimeout*2)
-	defer cancel()
-
-	account, err := s.accounts.Add(ctx, req.Username, req.Password, int64(req.TrafficLimitGB)*bytesPerGB)
+	account, err := s.accounts.Add(r.Context(), req.Username, req.Password, int64(req.TrafficLimitGB)*bytesPerGB)
 	if err != nil {
-		lowerErr := strings.ToLower(err.Error())
-		message := friendlyPikPakError(err)
-		status := http.StatusUnauthorized
-		switch {
-		case strings.Contains(lowerErr, "required"), strings.Contains(lowerErr, "empty"):
-			status = http.StatusBadRequest
-		case strings.Contains(lowerErr, "password"), strings.Contains(lowerErr, "login"):
-			status = http.StatusUnauthorized
-		default:
-			status = http.StatusBadGateway
+		if errors.Is(err, errAccountCredentialsRequired) {
+			writeError(w, http.StatusBadRequest, err.Error())
+		} else {
+			s.logJob(LogError, "", "保存 PikPak 账号失败", err.Error())
+			writeError(w, http.StatusInternalServerError, "账号未保存：本地数据库写入失败，请查看日志")
 		}
-		writeError(w, status, message)
 		return
 	}
+	s.logJob(LogSuccess, "", "PikPak 账号已保存，登录验证将在首次使用或手动重登时进行")
 
 	writeJSON(w, http.StatusCreated, account)
 }
@@ -489,6 +484,11 @@ func (s *Server) handleRefreshAccountLogin(w http.ResponseWriter, r *http.Reques
 			status = http.StatusBadRequest
 		case strings.Contains(lowerErr, "password"), strings.Contains(lowerErr, "login"):
 			status = http.StatusUnauthorized
+		}
+		if !strings.Contains(lowerErr, "not found") && s.accounts != nil {
+			now := s.now()
+			s.handleAccountStatePersistence("manual-login-failed", r.PathValue("id"),
+				s.accounts.MarkCredentialCheckFailed(r.PathValue("id"), err, now, now.Add(s.accountHealthInterval())))
 		}
 		writeError(w, status, friendlyPikPakError(err))
 		return
@@ -1596,8 +1596,8 @@ func (s *Server) processJob(ctx context.Context, jobID string) {
 	rotate := s.resolver.concurrencyValue() > 1
 	accounts := s.accounts.ResolveOrder(rotate)
 	if len(accounts) == 0 {
-		s.logJob(LogError, jobID, "没有可用的 PikPak 账号")
-		s.failJob(jobID, errors.New("no PikPak accounts are available"))
+		s.logJob(LogError, jobID, "无法取得解析账号", "没有未达到流量上限的 PikPak 账号")
+		s.failJob(jobID, errors.New("没有未达到流量上限的 PikPak 账号"))
 		return
 	}
 
@@ -2181,11 +2181,7 @@ func (s *Server) finalizeCompletedJob(jobID string, account AccountRuntime, resu
 	committed := false
 	defer func() { traffic.finish(committed) }()
 
-	resultSet := append([]JobResult(nil), results...)
-	if result != nil {
-		resultSet = append([]JobResult{*result}, resultSet...)
-	}
-	cleanupAfter := proxyDeferredCleanupAfter(resultSet, now)
+	cleanupAfter := temporaryResourceCleanupAfter(now)
 	var cleanupIDs []string
 
 	_, err = s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
@@ -2273,11 +2269,7 @@ func (s *Server) recordTempResource(jobID, accountID string, ids ...string) erro
 		return wrapJobPersistenceError("persist temporary cleanup intent", errors.New("temporary cleanup storage is not configured"))
 	}
 	now := s.now()
-	cleanupDelay := proxyTempCleanupFallbackTTL
-	if s.resolver != nil && s.resolver.currentTimeout() > cleanupDelay {
-		cleanupDelay = s.resolver.currentTimeout()
-	}
-	cleanupAfter := now.Add(cleanupDelay + proxyTempCleanupGrace)
+	cleanupAfter := temporaryResourceCleanupAfter(now)
 	_, err := s.jobs.updateAtomic(s.db, jobID, func(job *Job) error {
 		if job.TempAccountID != "" && job.TempAccountID != accountID {
 			return errors.New("temporary resource account cannot be changed")

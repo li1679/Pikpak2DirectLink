@@ -143,6 +143,8 @@ const (
 
 const badResourceParseUserError = "该磁链连续遇到解析错误，请不要反复重试此链接。"
 
+var errAccountCredentialsRequired = errors.New("请填写用户名和密码")
+
 func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	if cfg.Store == nil {
 		return nil, errors.New("SQLite account storage is required")
@@ -163,69 +165,46 @@ func NewAccountPool(cfg AccountPoolConfig) (*AccountPool, error) {
 	return pool, nil
 }
 
-func (p *AccountPool) Add(ctx context.Context, username, password string, trafficLimit int64) (AccountSummary, error) {
+// Add saves credentials locally without requiring a successful remote login.
+// Network verification belongs to first use or an explicit RefreshLogin call.
+func (p *AccountPool) Add(_ context.Context, username, password string, trafficLimit int64) (AccountSummary, error) {
 	username = strings.TrimSpace(username)
 	if username == "" || strings.TrimSpace(password) == "" {
-		return AccountSummary{}, errors.New("username and password are required")
+		return AccountSummary{}, errAccountCredentialsRequired
 	}
 	if trafficLimit <= 0 {
 		trafficLimit = defaultAccountTraffic
 	}
-
-	staged := newStagingSessionStore()
-	client := p.newClientWithSessionStore(username, password, staged)
-	if err := client.Login(ctx, username, password); err != nil {
-		return AccountSummary{}, err
-	}
-	premiumInfo, premiumErr := client.GetVIPInfo(ctx)
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	id := p.accountIdentityLocked(username)
-
 	now := time.Now()
-	existingState, existed := p.accounts[id]
-	createdAt := now
+	existing, existed := p.accounts[id]
+	record := accountRecord{ID: id, Username: username, Password: password, Status: AccountAvailable,
+		TrafficLimit: trafficLimit, TrafficPeriod: monthKey(now), CreatedAt: now, UpdatedAt: now,
+		CredentialNextCheckAt: formatAccountTime(now.Add(defaultAccountHealthCheckInterval))}
+	resetSession := !existed || existing.record.Password != password
 	if existed {
-		createdAt = existingState.record.CreatedAt
-	}
-
-	record := accountRecord{
-		ID:                    id,
-		Username:              username,
-		Password:              password,
-		Status:                AccountAvailable,
-		TrafficLimit:          trafficLimit,
-		TrafficPeriod:         monthKey(now),
-		CredentialNextCheckAt: formatAccountTime(now),
-		CreatedAt:             createdAt,
-		UpdatedAt:             now,
-	}
-	// Re-adding an existing account keeps its accrued usage for the month.
-	if existed {
-		record.TrafficUsed = existingState.record.TrafficUsed
-		record.ParseErrors = append([]ParseError(nil), existingState.record.ParseErrors...)
-		record.CredentialCheckedAt = existingState.record.CredentialCheckedAt
-		record.CredentialNextCheckAt = existingState.record.CredentialNextCheckAt
-		record.CredentialCheckError = existingState.record.CredentialCheckError
-		if existingState.record.TrafficPeriod != "" {
-			record.TrafficPeriod = existingState.record.TrafficPeriod
+		record.CreatedAt = existing.record.CreatedAt
+		record.TrafficUsed = existing.record.TrafficUsed
+		record.ParseErrors = append([]ParseError(nil), existing.record.ParseErrors...)
+		if existing.record.TrafficPeriod != "" {
+			record.TrafficPeriod = existing.record.TrafficPeriod
+		}
+		if !resetSession {
+			record.Premium, record.PremiumType, record.PremiumUntil = existing.record.Premium, existing.record.PremiumType, existing.record.PremiumUntil
+			record.PremiumCheckedAt = existing.record.PremiumCheckedAt
+			record.CredentialCheckedAt = existing.record.CredentialCheckedAt
 		}
 	}
-	updatePremiumRecord(&record, premiumInfo, premiumErr, now)
-	session, err := staged.Load()
-	if err != nil {
-		return AccountSummary{}, fmt.Errorf("read staged PikPak session: %w", err)
-	}
-	if err := p.store.UpsertWithSession(record, session); err != nil {
+	if err := p.store.SaveCredentials(record, resetSession); err != nil {
 		return AccountSummary{}, err
 	}
-	client = p.newClient(id, username, password)
-
-	p.accounts[id] = &accountState{
-		record: record,
-		client: client,
+	var client pikpakClient = p.newClient(id, username, password)
+	if existed && !resetSession {
+		client = existing.client
 	}
+	p.accounts[id] = &accountState{record: record, client: client}
 	if !existed {
 		p.order = append(p.order, id)
 	}
@@ -358,7 +337,7 @@ func (p *AccountPool) RefreshPremiumInfo(ctx context.Context) error {
 	targets := make([]target, 0, len(p.order))
 	for _, id := range p.order {
 		state := p.accounts[id]
-		if state == nil || state.client == nil {
+		if state == nil || state.client == nil || !state.client.Status().LoggedIn {
 			continue
 		}
 		if premiumInfoNeedsRefresh(state.record, now) {
@@ -494,62 +473,29 @@ func (p *AccountPool) Snapshot() []AccountRuntime {
 	return accounts
 }
 
-// ResolveOrder returns accounts in the order a resolve job should try them.
-//
-// Accounts that have hit their monthly downstream-traffic limit are excluded
-// entirely (in both modes) — that exclusion is the whole point of the limit, so
-// they are not even used as a fallback. When rotate is false (serial mode) the
-// remaining accounts keep their stored order, regardless of failure status, as
-// before. When rotate is true (parallel mode) currently-available accounts come
-// first, rotated by a per-call cursor so concurrent jobs fan out instead of all
-// hammering the first one; failed accounts are appended last as a fallback.
+// ResolveOrder returns every account below its own traffic limit. A previous
+// validation failure is only a hint; each automatic task still retries it.
+// Parallel starts rotate across the complete pool, including failed accounts.
 func (p *AccountPool) ResolveOrder(rotate bool) []AccountRuntime {
 	now := time.Now()
 	p.mu.RLock()
-	if !rotate {
-		accounts := make([]AccountRuntime, 0, len(p.order))
-		for _, id := range p.order {
-			state := p.accounts[id]
-			if state == nil || accountTrafficLimited(state.record, now) {
-				continue
-			}
-			accounts = append(accounts, AccountRuntime{
-				ID:       state.record.ID,
-				Username: state.record.Username,
-				Client:   state.client,
-			})
-		}
-		p.mu.RUnlock()
-		return accounts
-	}
-
-	var available, failed []AccountRuntime
+	accounts := make([]AccountRuntime, 0, len(p.order))
 	for _, id := range p.order {
 		state := p.accounts[id]
 		if state == nil || accountTrafficLimited(state.record, now) {
 			continue
 		}
-		rt := AccountRuntime{
-			ID:       state.record.ID,
-			Username: state.record.Username,
-			Client:   state.client,
-		}
-		if state.record.Status == AccountFailed {
-			failed = append(failed, rt)
-		} else {
-			available = append(available, rt)
-		}
+		accounts = append(accounts, AccountRuntime{ID: state.record.ID, Username: state.record.Username, Client: state.client})
 	}
 	p.mu.RUnlock()
-
-	if len(available) > 1 {
-		off := int((atomic.AddUint64(&p.cursor, 1) - 1) % uint64(len(available)))
-		rotated := make([]AccountRuntime, 0, len(available))
-		rotated = append(rotated, available[off:]...)
-		rotated = append(rotated, available[:off]...)
-		available = rotated
+	if rotate && len(accounts) > 1 {
+		offset := int((atomic.AddUint64(&p.cursor, 1) - 1) % uint64(len(accounts)))
+		rotated := make([]AccountRuntime, 0, len(accounts))
+		rotated = append(rotated, accounts[offset:]...)
+		rotated = append(rotated, accounts[:offset]...)
+		accounts = rotated
 	}
-	return append(available, failed...)
+	return accounts
 }
 
 func (p *AccountPool) Get(id string) (AccountRuntime, bool) {

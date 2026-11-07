@@ -62,8 +62,8 @@ watch(
       <div class="id">
         <h3 class="uname" :title="account.username">{{ account.username }}</h3>
         <div class="sub">
-          <span class="pill" :class="failed ? 'pill-danger' : 'pill-ok'">
-            <component :is="failed ? XCircle : CheckCircle2" />{{ failed ? '失败' : '可用' }}
+          <span class="pill" :class="failed ? 'pill-danger' : !account.logged_in ? 'pill-live' : 'pill-ok'">
+            <component :is="failed ? XCircle : !account.logged_in ? AlertTriangle : CheckCircle2" />{{ failed ? '验证未通过 · 已保留' : !account.logged_in ? '已保存 · 待验证' : '可用' }}
           </span>
           <span v-if="account.premium" class="pill pill-live"><Crown />VIP · {{ premiumUntil }}</span>
           <span v-if="account.traffic_limited" class="pill pill-live">流量受限</span>
@@ -90,6 +90,7 @@ watch(
       <div v-if="account.credential_check_error" class="errline">
         <AlertTriangle /><span>凭据检查：{{ account.credential_check_error }}</span>
       </div>
+      <div v-if="!account.logged_in && !failed" class="meta">首次解析时自动登录，或点击“重新登录”验证；同名账号重新保存可更新密码。</div>
       <div class="meta">下次凭据检查：{{ nextCheck }}</div>
     </div>
 
@@ -103,7 +104,7 @@ watch(
       <template v-else>
         <button class="btn btn-line btn-sm" type="button" @click="startEdit"><Pencil />流量上限</button>
         <button v-if="failed" class="btn btn-line btn-sm" type="button" :disabled="busy" @click="emit('reset', account.id)"><RotateCcw />重置</button>
-        <button class="btn btn-line btn-sm" type="button" :disabled="busy" @click="emit('refresh', account.id)"><RefreshCw />重登</button>
+        <button class="btn btn-line btn-sm" type="button" :disabled="busy" @click="emit('refresh', account.id)"><RefreshCw />重新登录</button>
         <button class="btn btn-danger btn-sm btn-icon" type="button" :disabled="busy" @click="emit('delete', account.id)"><Trash2 /></button>
       </template>
     </footer>

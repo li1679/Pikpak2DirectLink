@@ -840,7 +840,7 @@ func TestProxySingleStreamLogsUpstreamReadError(t *testing.T) {
 	}
 }
 
-func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
+func TestCompleteJobKeepsTempResourcesForSixHoursRegardlessOfLinkExpiry(t *testing.T) {
 	now := time.Now()
 	db, err := openDatabase(t.TempDir() + "/app.db")
 	if err != nil {
@@ -851,7 +851,7 @@ func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
 
 	client := &fakePikPakClient{
 		getFile: func(context.Context, string) (*pikpak.FileEntry, error) {
-			return fakeDownloadFile("file-1", "https://cdn.example/file.bin", now.Add(time.Hour)), nil
+			return fakeDownloadFile("file-1", "https://cdn.example/file.bin", now.Add(48*time.Hour)), nil
 		},
 	}
 	accountStore := newAccountStore(db, cipher)
@@ -894,7 +894,10 @@ func TestCompleteJobDefersTempCleanupUntilDirectLinkExpiry(t *testing.T) {
 	if deleteCalls != 0 {
 		t.Fatalf("DeleteFiles calls immediately after completeJob = %d, want 0", deleteCalls)
 	}
-	dueAt := now.Add(4 * time.Hour)
+	if early, err := s.tempCleanups.due(now.Add(temporaryResourceTTL-time.Second), 10); err != nil || len(early) != 0 {
+		t.Fatalf("resources expired before six hours: %+v %v", early, err)
+	}
+	dueAt := now.Add(temporaryResourceTTL)
 	due, err := s.tempCleanups.due(dueAt, 10)
 	if err != nil {
 		t.Fatalf("cleanup due: %v", err)

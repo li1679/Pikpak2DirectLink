@@ -16,22 +16,30 @@
 
 ## 下载和开始使用
 
-当前桌面版本：**1.0.1 · Windows x64**。
+当前桌面版本：**1.0.2 · Windows x64**。
 
 | 下载 | 使用方式 |
 | --- | --- |
-| [Windows 安装包](https://github.com/li1679/Pikpak2DirectLink/releases/download/desktop-v1.0.1/PikPak-Personal-1.0.1-windows-x64-setup.exe) | 安装后从开始菜单打开 **PikPak Personal**。 |
-| [免安装 ZIP](https://github.com/li1679/Pikpak2DirectLink/releases/download/desktop-v1.0.1/PikPak-Personal-1.0.1-windows-x64-portable.zip) | 解压完整文件夹，双击 `PikPak Personal.exe`。 |
+| [Windows 安装包](https://github.com/li1679/Pikpak2DirectLink/releases/download/desktop-v1.0.2/PikPak-Personal-1.0.2-windows-x64-setup.exe) | 安装后从开始菜单打开 **PikPak Personal**。 |
+| [免安装 ZIP](https://github.com/li1679/Pikpak2DirectLink/releases/download/desktop-v1.0.2/PikPak-Personal-1.0.2-windows-x64-portable.zip) | 解压完整文件夹，双击 `PikPak Personal.exe`。 |
 
 免安装版的 `pikpak-service.exe` 必须与主程序放在同一目录。使用时不需要安装 Go、Rust 或 Node.js，也不用手动配置环境变量和加密密钥。
 
 应用使用 Microsoft Edge WebView2。电脑缺少运行时时，安装器会尝试补装，可能需要联网。当前安装包未进行代码签名。
 
-1. 打开应用，在「PikPak 账号」中添加自己的账号。
+1. 在「PikPak 账号」中填写账号和密码，点击「保存账号」。先加密保存，不以登录验证结果作为添加条件；首次解析时自动登录，也可手动点「重新登录」验证。
 2. 在「解析」页粘贴磁力链接或分享链接；多条链接按行输入，需要时填写提取码。
 3. 完成后选择文件，复制直链、使用代理下载，或推送到 aria2。
 
 **关闭窗口会停止后台解析和本机代理下载，下载时请保持应用运行。** 重复启动会唤起已有窗口，不会再开一套后台。
+
+账号密码错误、风控提示或网络验证失败不会删除已保存账号。同名账号重新保存可更新密码；只有凭据为空或本地写入失败才会阻止保存。历史报错账号仍会自动参与解析和轮转，无需手动重置或选账号；单个账号失败后继续尝试其他账号，达到本月流量上限的账号仍会跳过。
+
+### 临时资源只保留 6 小时
+
+本程序在网盘中创建或转存的临时资源，从首次记录创建时起保留最多 **6 小时**；直链刷新、任务完成和重启不会延长。到期后由运行中的应用定期清理，删除失败保留记录并重试，关闭期间过期的重开后补删。失败任务和文件列表检查的资源可提前清理。
+
+只按本程序的资源台账删除，不扫描或删除你原有的网盘文件，也不删除文件库中的资源来源记录。应用需保持运行且 PikPak 账号可访问，才能执行网盘删除；这不是 PikPak 云端定时删除。
 
 ## 能做什么
 

@@ -47,7 +47,7 @@ async function addAccount() {
       traffic_limit_gb: form.value.traffic_limit_gb || 700,
     })
     form.value = { username: '', password: '', traffic_limit_gb: 700 }
-    toast('账号已添加', 'success')
+    toast('账号已保存，首次解析时自动登录，也可手动验证', 'success')
     await load()
     emit('changed')
   } catch (e: any) {
@@ -72,7 +72,8 @@ async function action(id: string, kind: 'update' | 'delete' | 'reset' | 'refresh
     await load()
     emit('changed')
   } catch (e: any) {
-    toast(e?.message || '操作失败', 'error')
+    toast(kind === 'refresh' ? `验证未通过，账号已保留：${e?.message || '请稍后重试'}` : (e?.message || '操作失败'), 'error')
+    if (kind === 'refresh') await load()
   } finally {
     busyId.value = ''
   }
@@ -88,14 +89,14 @@ defineExpose({ refresh: load })
       <div class="sec-head mb">
         <div class="sec-title">
           <span class="sec-glyph"><Users /></span>
-          <div><span class="eyebrow">accounts</span><h2>添加 PikPak 账号</h2><p>账号保存在本地数据目录，用于解析与刷新 session</p></div>
+          <div><span class="eyebrow">accounts</span><h2>添加 PikPak 账号</h2><p>先加密保存，不检查密码或登录状态；首次解析时自动登录，也可手动验证</p></div>
         </div>
       </div>
       <form class="add-form" @submit.prevent="addAccount">
         <label class="field"><span class="field-label">邮箱 / 手机号 / 用户名</span><input v-model="form.username" class="input" type="text" autocomplete="username" /></label>
         <label class="field"><span class="field-label">PikPak 密码</span><input v-model="form.password" class="input" type="password" autocomplete="current-password" /></label>
         <label class="field"><span class="field-label">最大流量 (GB)</span><input v-model.number="form.traffic_limit_gb" class="input input-mono" type="number" min="1" step="1" inputmode="numeric" /></label>
-        <PrimaryButton type="submit" :loading="adding"><template #icon><UserPlus /></template>添加并登录</PrimaryButton>
+        <PrimaryButton type="submit" :loading="adding"><template #icon><UserPlus /></template>保存账号</PrimaryButton>
       </form>
       <Transition name="v-fade"><p v-if="formErr" class="error-block">{{ formErr }}</p></Transition>
     </GlassCard>

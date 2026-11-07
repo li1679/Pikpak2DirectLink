@@ -174,11 +174,27 @@ func TestAccountPoolResolveOrder(t *testing.T) {
 		t.Fatalf("expected rotating start accounts, all began with %q", firsts[0])
 	}
 
-	// A failed account sinks to the back of the parallel order.
+	// A failed account remains in the automatic pool, and parallel rotation
+	// rotates across failed and healthy accounts alike.
 	pool.MarkFailed("a", errors.New("boom"))
-	got := orderIDs(pool.ResolveOrder(true))
-	if got[len(got)-1] != "a" {
-		t.Fatalf("failed account not last: %v", got)
+	firsts = []string{orderIDs(pool.ResolveOrder(true))[0], orderIDs(pool.ResolveOrder(true))[0], orderIDs(pool.ResolveOrder(true))[0]}
+	if firsts[0] == firsts[1] && firsts[1] == firsts[2] {
+		t.Fatalf("failed account was skipped by rotation: %v", firsts)
+	}
+	for _, rotate := range []bool{false, true} {
+		got := orderIDs(pool.ResolveOrder(rotate))
+		if len(got) != 3 {
+			t.Fatalf("failed account excluded, rotate=%v: %v", rotate, got)
+		}
+		found := false
+		for _, id := range got {
+			if id == "a" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("failed account absent, rotate=%v: %v", rotate, got)
+		}
 	}
 }
 

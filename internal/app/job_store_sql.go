@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	resolveJobDetailsTTL = 3 * time.Hour
+	resolveJobDetailsTTL = 6 * time.Hour
 	resolveJobRecordTTL  = 30 * 24 * time.Hour
 
 	resolveJobPayloadPurpose = "resolve_jobs.payload"

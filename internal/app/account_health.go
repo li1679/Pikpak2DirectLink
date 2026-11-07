@@ -134,6 +134,7 @@ func (s *Server) runAccountCredentialCheck(ctx context.Context, account AccountR
 	probeCtx, cancel := context.WithTimeout(ctx, s.accountHealthTimeout())
 	result, err := s.accountHealthProbeFunc()(probeCtx, account)
 	cancel()
+	s.trackFailedHealthCleanup(account, result, s.now())
 	if ctx.Err() != nil {
 		return
 	}
@@ -193,6 +194,7 @@ func (s *Server) handleAccountHealthFailure(ctx context.Context, account Account
 	recheckCtx, cancelRecheck := context.WithTimeout(ctx, s.accountHealthTimeout())
 	result, recheckErr := s.accountHealthProbeFunc()(recheckCtx, refreshed)
 	cancelRecheck()
+	s.trackFailedHealthCleanup(account, result, s.now())
 	if ctx.Err() != nil {
 		return
 	}
@@ -275,6 +277,20 @@ func (s *Server) accountHealthTimeout() time.Duration {
 		requestTimeout = 20 * time.Second
 	}
 	return maxDuration(requestTimeout*3, time.Minute)
+}
+
+// Failed immediate probe cleanup must also survive process restarts.
+func (s *Server) trackFailedHealthCleanup(account AccountRuntime, result accountCredentialProbeResult, now time.Time) {
+	if result.CleanupErr == nil || len(result.RestoredIDs) == 0 || s.tempCleanups == nil {
+		return
+	}
+	id, err := newJobID()
+	if err == nil {
+		err = s.tempCleanups.record("health-"+id, account.ID, result.RestoredIDs, temporaryResourceCleanupAfter(now), now)
+	}
+	if err != nil {
+		s.handleAccountStatePersistence("record-health-cleanup", account.ID, err)
+	}
 }
 
 func (s *Server) now() time.Time {

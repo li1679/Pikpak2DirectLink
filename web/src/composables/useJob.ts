@@ -84,7 +84,7 @@ export function useJob<T extends JobLike>(adapter: JobAdapter<T>) {
     schedulePoll(j.id)
   }
 
-  async function submit(input: string, passCode: string, mode: JobMode) {
+	async function submit(input: string, passCode: string, mode: JobMode) {
     clearTimer()
     error.value = ''
     const version = ++generation
@@ -92,7 +92,7 @@ export function useJob<T extends JobLike>(adapter: JobAdapter<T>) {
     submitting.value = true
     job.value = null
     try {
-      const j = await adapter.create({ input, pass_code: passCode || undefined, mode })
+		const j = await adapter.create({ input, pass_code: passCode || undefined, mode })
       if (!alive || version !== generation) return
       job.value = j
       handle(j)

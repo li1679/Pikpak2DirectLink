@@ -165,6 +165,43 @@ func (s *accountStore) Insert(record accountRecord) error {
 	return nil
 }
 
+// SaveCredentials atomically stores an account even when no PikPak session exists.
+// A password change invalidates only that account's old session.
+func (s *accountStore) SaveCredentials(record accountRecord, resetSession bool) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	item, err := s.prepareAccount(record)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var order int
+	err = tx.QueryRow(`SELECT sort_order FROM pikpak_accounts WHERE id=?`, record.ID).Scan(&order)
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRow(`SELECT COALESCE(MAX(sort_order),-1)+1 FROM pikpak_accounts`).Scan(&order); err != nil {
+			return err
+		}
+		if err := insertAccount(tx, item, order); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if err := upsertAccount(tx, item, order); err != nil {
+		return err
+	}
+	if resetSession {
+		if _, err := tx.Exec(`DELETE FROM pikpak_account_sessions WHERE account_id=?`, record.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (s *accountStore) UpsertWithSession(record accountRecord, session []byte) error {
 	if err := s.validate(); err != nil {
 		return err

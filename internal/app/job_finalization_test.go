@@ -227,7 +227,7 @@ func TestCleanupFailureDetachesActiveAccountButKeepsLedger(t *testing.T) {
 	if err := server.recordTempResource("retry-job", "account-b", "temp-b"); err != nil {
 		t.Fatalf("record second account cleanup intent: %v", err)
 	}
-	due, err := cleanups.due(now.Add(4*time.Hour), 10)
+	due, err := cleanups.due(now.Add(temporaryResourceTTL), 10)
 	if err != nil {
 		t.Fatal(err)
 	}

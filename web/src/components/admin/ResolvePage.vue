@@ -32,9 +32,9 @@ const results = computed(() => {
   return []
 })
 
-function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
+	function onSubmit(payload: { input: string; passCode: string; mode: 'direct' | 'proxy' }) {
   selectedIds.value = []
-  submit(payload.input, payload.passCode, payload.mode)
+	submit(payload.input, payload.passCode, payload.mode)
 }
 function confirmSelection() {
   if (!selectedIds.value.length) { toast('请至少选择一个文件', 'error'); return }

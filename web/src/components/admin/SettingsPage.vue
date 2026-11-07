@@ -138,6 +138,7 @@ onUnmounted(() => {
         队列 <b class="mono">{{ settings?.waiting ?? 0 }} 等待 / {{ settings?.running ?? 0 }} 运行</b>
       </p>
       <Transition name="v-fade"><p v-if="concErr" class="error-block">{{ concErr }}</p></Transition>
+      <p class="state">网盘临时资源保留 6 小时，到期自动删除；应用关闭期间无法清理，重新打开后补删。只清理本程序创建或转存的资源。</p>
     </GlassCard>
 
     <GlassCard seam>

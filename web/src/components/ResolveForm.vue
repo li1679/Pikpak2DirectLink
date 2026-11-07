@@ -17,12 +17,11 @@ const input = ref('')
 const passCode = ref('')
 const mode = ref<'direct' | 'proxy'>('direct')
 
-const lineCount = computed(() => input.value.split('\n').filter((l) => l.trim()).length)
+const lineCount = computed(() => input.value.split('\n').filter((line) => line.trim()).length)
 const isBatch = computed(() => lineCount.value > 1)
 
 function onSubmit() {
-  if (props.loading || props.disabled) return
-  if (!input.value.trim()) return
+  if (props.loading || props.disabled || !input.value.trim()) return
   emit('submit', { input: input.value, passCode: passCode.value, mode: mode.value })
 }
 </script>
@@ -75,7 +74,6 @@ https://mypikpak.com/s/...
 .mode-seg { width: 100%; }
 .mode-seg .seg-item { flex: 1 1 0; }
 .mode-seg .seg-item span { width: 100%; justify-content: center; }
-
 @media (max-width: 760px) {
   .rform { grid-template-columns: 1fr; }
   .submit-btn { margin-top: 0; }

@@ -13,11 +13,10 @@ import (
 )
 
 const (
-	proxyTempCleanupFallbackTTL = 3 * time.Hour
-	proxyTempCleanupGrace       = 10 * time.Minute
-	proxyTempCleanupRetryDelay  = 10 * time.Minute
-	proxyTempCleanupBatchLimit  = 20
-	proxyTempCleanupPurpose     = "proxy_temp_cleanups.file_ids"
+	temporaryResourceTTL       = 6 * time.Hour
+	proxyTempCleanupRetryDelay = 10 * time.Minute
+	proxyTempCleanupBatchLimit = 20
+	proxyTempCleanupPurpose    = "proxy_temp_cleanups.file_ids"
 )
 
 type proxyTempCleanupStore struct {
@@ -72,8 +71,8 @@ func (s *proxyTempCleanupStore) recordTx(tx *sql.Tx, jobID, accountID string, id
 	if createdAt.IsZero() {
 		createdAt = time.Now()
 	}
-	if cleanupAfter.IsZero() {
-		cleanupAfter = createdAt.Add(proxyTempCleanupFallbackTTL)
+	if cleanupAfter.IsZero() || cleanupAfter.After(createdAt.Add(temporaryResourceTTL)) {
+		cleanupAfter = createdAt.Add(temporaryResourceTTL)
 	}
 	id := cleanupRecordID(jobID, accountID)
 	var existingJob, existingAccount, existingIDs string
@@ -100,7 +99,7 @@ func (s *proxyTempCleanupStore) recordTx(tx *sql.Tx, jobID, accountID string, id
 			VALUES(?,?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET
 			account_id=excluded.account_id,file_ids_json=excluded.file_ids_json,
-			cleanup_after=excluded.cleanup_after,attempts=0,last_error=NULL`,
+			cleanup_after=MIN(proxy_temp_cleanups.cleanup_after,excluded.cleanup_after,proxy_temp_cleanups.created_at+?),attempts=0,last_error=NULL`,
 		id,
 		jobID,
 		accountID,
@@ -108,7 +107,19 @@ func (s *proxyTempCleanupStore) recordTx(tx *sql.Tx, jobID, accountID string, id
 		cleanupAfter.Unix(),
 		0,
 		createdAt.Unix(),
+		int64(temporaryResourceTTL/time.Second),
 	)
+	return err
+}
+
+// Apply the six-hour policy to pending records created by this personal version.
+// Failed deletions keep their retry delay instead of retrying in a tight loop.
+func (s *proxyTempCleanupStore) enforceRetentionLimit() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE proxy_temp_cleanups SET cleanup_after=created_at+?
+		WHERE attempts=0 AND cleanup_after>created_at+?`, int64(temporaryResourceTTL/time.Second), int64(temporaryResourceTTL/time.Second))
 	return err
 }
 
@@ -335,18 +346,12 @@ func (s *proxyTempCleanupStore) delete(id string) error {
 	return err
 }
 
-func proxyDeferredCleanupAfter(results []JobResult, completedAt time.Time) time.Time {
-	if completedAt.IsZero() {
-		completedAt = time.Now()
+// The first recorded resource creation starts the timer; link expiry never extends it.
+func temporaryResourceCleanupAfter(createdAt time.Time) time.Time {
+	if createdAt.IsZero() {
+		createdAt = time.Now()
 	}
-	cleanupAfter := completedAt.Add(proxyTempCleanupFallbackTTL)
-	for _, result := range results {
-		expiresAt, ok := parseProxyResultExpiry(result.ExpiresAt)
-		if ok && expiresAt.After(cleanupAfter) {
-			cleanupAfter = expiresAt
-		}
-	}
-	return cleanupAfter.Add(proxyTempCleanupGrace)
+	return createdAt.Add(temporaryResourceTTL)
 }
 
 func parseProxyResultExpiry(value string) (time.Time, bool) {
